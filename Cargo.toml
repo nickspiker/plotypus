@@ -1,0 +1,72 @@
+[package]
+name = "plotipus"
+version = "0.0.1"
+edition = "2024"
+authors = ["Nick Spiker <fractaldecoder@proton.me>"]
+description = "2D graphing calculator self-hosted on Spirix"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "plotipus"
+path = "src/main.rs"
+
+[features]
+default = []
+logging = []
+debug-keys = []
+development = ["logging", "debug-keys"]
+
+[dependencies]
+spirix = { path = "../spirix" }
+
+# UI / windowing / text (lifted from Photon)
+cosmic-text = "0.14.2"
+rayon = "1.11.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Colour pipeline (display_profile.rs uses these)
+icc-profile = "0.0.2"
+vsf = { path = "../vsf", default-features = false }
+
+# Misc utilities used by the lifted UI code
+rgb = "0.8.52"
+i256 = "0.2.3"
+bitvec = "1.0.1"
+rand = "0.8.5"
+dirs = "6.0.0"
+libc = "0.2.178"
+chrono = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "28", default-features = false, features = ["metal", "wgsl"] }
+pollster = "0.4.0"
+winit = "0.30.12"
+softbuffer = "0.4"
+arboard = "3.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11 = { version = "2.21.0", features = ["xlib"] }
+winit = "0.30.12"
+softbuffer = "0.4"
+arboard = "3.4"
+
+# Photon's softbuffer fork — Plotipus inherits the same patch for Wayland dirty-region work
+[patch.crates-io]
+softbuffer = { git = "https://github.com/nickspiker/softbuffer", branch = "main" }
+
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+debug = false
+debug-assertions = false
+lto = false
+codegen-units = 16
+incremental = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+overflow-checks = false
+panic = "abort"
