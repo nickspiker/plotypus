@@ -19,9 +19,9 @@ pub use renderer_linux_softbuffer as renderer;
 #[cfg(target_os = "macos")]
 pub use renderer_macos as renderer;
 
-pub use app::PlotipusApp;
+pub use app::PlotypusApp;
 
 #[derive(Debug, Clone)]
-pub enum PlotipusEvent {
+pub enum PlotypusEvent {
     Redraw,
 }

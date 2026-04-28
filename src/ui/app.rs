@@ -31,7 +31,7 @@ pub enum ResizeEdge {
     BottomRight,
 }
 
-pub struct PlotipusApp {
+pub struct PlotypusApp {
     pub width: u32,
     pub height: u32,
     pub renderer: Renderer,
@@ -69,7 +69,7 @@ fn compute_span(width: u32, height: u32) -> f32 {
     2.0 * w * h / (w + h).max(1.0)
 }
 
-impl PlotipusApp {
+impl PlotypusApp {
     pub fn new(window: &Window) -> Self {
         let size = window.inner_size();
         let width = size.width.max(1);
@@ -268,7 +268,7 @@ impl PlotipusApp {
         self.text_renderer.draw_text_center_u32(
             pixels,
             width,
-            "Plotipus",
+            "Plotypus",
             center_x,
             title_y,
             font_size,

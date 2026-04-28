@@ -1,0 +1,75 @@
+# PLOTYPUS LICENSE
+Version 0, April 2026
+Copyright © 2026 Nick Spiker
+
+## Terms and Conditions
+
+### Definitions
+
+- "Plotypus" refers to the 2D and 3D graphing calculator software, including all source code, assets, documentation, and any implementation thereof.
+- "Software Implementation" refers to any implementation of Plotypus or its substantive components in a programming language.
+- "Hardware Implementation" refers to any embodiment of Plotypus or its substantive components in hardware, including but not limited to FPGA bitstreams, ASIC tape-outs, custom silicon, microcontroller firmware, and any photolithographic or non-reprogrammable integrated circuit.
+- "Substantive Component" refers to any non-trivial portion of Plotypus that constitutes a recognisable subsystem (e.g. the input parser, the evaluator, the rendering pipeline, the chrome/compositing layer).
+- "Sale" refers to any transaction in which Plotypus or any Substantive Component thereof is the principal good or service being exchanged for monetary or equivalent compensation, including paid downloads, paid app-store distribution, paid hosted access, and paid licensing of the software or hardware embodiment itself.
+- "Licensee" refers to any individual or entity using Plotypus.
+
+### Grant of License
+
+Subject to the terms and conditions of this License, Nick Spiker hereby grants you a worldwide, royalty-free, non-exclusive, perpetual license to use, copy, modify, distribute, and create derivative works of Plotypus, including:
+
+- Software Implementations in any language, on any platform.
+- Hardware Implementations of any kind, including FPGA, ASIC, custom silicon, and any other embodiment, with no royalties owed and no separate license required. Burn it in hardware; that's fine.
+- Use in personal, educational, research, and internal commercial contexts (where Plotypus is a tool you use, not a product you sell).
+- Redistribution of source code and binaries, modified or unmodified, provided this License is preserved and attribution to Nick Spiker is retained in source.
+
+### Restriction: No Sale
+
+You may not engage in the Sale of Plotypus or any Substantive Component thereof. Specifically, you may not:
+
+- Distribute Plotypus, or a derivative thereof, as a paid product.
+- Charge for access to a hosted instance whose principal value is Plotypus or a derivative thereof.
+- License Plotypus or its Substantive Components to third parties for a fee.
+- Sell Hardware Implementations whose principal value is the Plotypus algorithms or design (selling the hardware itself at cost or as part of a broader product where Plotypus is incidental is fine).
+
+Using Plotypus inside a larger product or service that is itself sold, where Plotypus is a tool or component but not the principal good, is permitted. Charging for support, customisation, or integration services around Plotypus is permitted.
+
+If you wish to engage in a Sale of Plotypus, contact Nick Spiker for a separate commercial license.
+
+### Attribution
+
+Source distributions must retain this License file and the copyright notice. Binary distributions and hardware embodiments must include a reasonable attribution to Nick Spiker, discoverable in documentation, about screens, or accompanying materials.
+
+### Patent Rights
+
+This License includes a worldwide, royalty-free, non-exclusive patent license covering any patents held by Nick Spiker that read on Plotypus, for any use permitted under this License, including Hardware Implementations.
+
+If you assert a patent claim against Nick Spiker or against any user of Plotypus alleging infringement by Plotypus or its use, your rights under this License terminate immediately.
+
+### Warranty and Liability
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL NICK SPIKER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Plotypus depends on Spirix for numeric arithmetic. Spirix is licensed separately under its own terms. The presence of Spirix in a Plotypus build does not grant any rights to Spirix beyond those granted by the Spirix license itself.
+
+### Termination
+
+This License terminates automatically if you breach any of its terms. Upon termination, you must cease all use and distribution of Plotypus and destroy all copies in your possession. Sections covering Patent Rights, Warranty, and Liability survive termination.
+
+### Export Compliance
+
+Licensee must comply with all applicable export and re-export control laws and regulations.
+
+### Governing Law
+
+This License shall be governed by and construed in accordance with the laws of the United States of America.
+
+### Contact
+
+For commercial licensing inquiries, questions, or clarifications:
+
+Nick Spiker
+fractaldecoder@proton.me
+
+---
+
+By using, copying, modifying, or distributing Plotypus, you agree to be bound by the terms of this License.

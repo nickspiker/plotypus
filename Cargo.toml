@@ -1,13 +1,13 @@
 [package]
-name = "plotipus"
-version = "0.0.1"
+name = "plotypus"
+version = "0.0.0"
 edition = "2024"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
-description = "2D graphing calculator self-hosted on Spirix"
-license = "MIT OR Apache-2.0"
+description = "2D and 3D graphing calculator self-hosted on Spirix"
+license-file = "LICENSE"
 
 [[bin]]
-name = "plotipus"
+name = "plotypus"
 path = "src/main.rs"
 
 [features]
@@ -50,7 +50,7 @@ winit = "0.30.12"
 softbuffer = "0.4"
 arboard = "3.4"
 
-# Photon's softbuffer fork — Plotipus inherits the same patch for Wayland dirty-region work
+# Photon's softbuffer fork — Plotypus inherits the same patch for Wayland dirty-region work
 [patch.crates-io]
 softbuffer = { git = "https://github.com/nickspiker/softbuffer", branch = "main" }
 

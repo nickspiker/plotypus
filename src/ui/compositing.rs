@@ -1,7 +1,7 @@
 //! Chrome rendering: window edges, squircle corner mask, top-right window controls.
 //! Lifted from Photon's compositing.rs (functions only — no PhotonApp coupling).
 
-use crate::ui::app::PlotipusApp;
+use crate::ui::app::PlotypusApp;
 use crate::ui::theme;
 
 pub const HIT_NONE: u8 = 0;
@@ -15,7 +15,7 @@ pub const PREMULTIPLIED: bool = true;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const PREMULTIPLIED: bool = false;
 
-impl PlotipusApp {
+impl PlotypusApp {
     /// Compute squircle corner geometry and button bounds without drawing.
     /// Returns (corner_start, crossings, button_x_start_with_offset, button_height).
     pub fn window_controls_bounds(

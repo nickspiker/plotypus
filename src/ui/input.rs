@@ -1,12 +1,12 @@
 //! Mouse + keyboard handlers for chrome interactions.
-//! Lifted concept from Photon's mouse.rs/keyboard.rs but trimmed to what Plotipus needs:
+//! Lifted concept from Photon's mouse.rs/keyboard.rs but trimmed to what Plotypus needs:
 //! - Window-control button click + hover
 //! - Edge-resize detection + cursor shape feedback
 //! - Body drag (delegates to winit::Window::drag_window)
 //! - Ctrl+D / Ctrl+H / Ctrl+T debug toggles
 //! - Ctrl/Cmd +/- zoom
 
-use crate::ui::app::{HoveredButton, PlotipusApp, ResizeEdge};
+use crate::ui::app::{HoveredButton, PlotypusApp, ResizeEdge};
 use crate::ui::compositing::{
     HIT_BODY, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
 };
@@ -32,13 +32,13 @@ pub enum KeyAction {
     Redraw,
 }
 
-impl PlotipusApp {
+impl PlotypusApp {
     pub fn update_modifiers(&mut self, mods: ModifiersState) {
         self.modifiers = mods;
     }
 
     /// Decide what a left-mouse-down at the current cursor position should do.
-    /// Caller owns the window and performs the action; this keeps PlotipusApp
+    /// Caller owns the window and performs the action; this keeps PlotypusApp
     /// independent of the winit::Window handle.
     pub fn handle_mouse_click(
         &mut self,
