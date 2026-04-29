@@ -1,5 +1,4 @@
-//! Chrome rendering: window edges, squircle corner mask, top-right window controls.
-//! Lifted from Photon's compositing.rs (functions only — no PhotonApp coupling).
+//! Chrome rendering: window edges, squircle corner mask, top-right window controls. Lifted from Photon's compositing.rs (functions only — no PhotonApp coupling).
 
 use crate::ui::app::PlotypusApp;
 use crate::ui::theme;
@@ -18,8 +17,7 @@ pub const PREMULTIPLIED: bool = true;
 pub const PREMULTIPLIED: bool = false;
 
 impl PlotypusApp {
-    /// Compute squircle corner geometry and button bounds without drawing.
-    /// Returns (corner_start, crossings, button_x_start_with_offset, button_height).
+    /// Compute squircle corner geometry and button bounds without drawing. Returns (corner_start, crossings, button_x_start_with_offset, button_height).
     pub fn window_controls_bounds(
         window_width: u32,
         window_height: u32,
@@ -64,8 +62,7 @@ impl PlotypusApp {
         (start, crossings, x_start + button_width / 4, button_height)
     }
 
-    /// Draw the three top-right window controls (minimize, maximize, close) and
-    /// populate hit_test_map for them.
+    /// Draw the three top-right window controls (minimize, maximize, close) and populate hit_test_map for them.
     pub fn draw_window_controls(
         pixels: &mut [u32],
         hit_test_map: &mut [u8],
@@ -538,9 +535,7 @@ impl PlotypusApp {
 
     /// Vertical hairline separators between the three top-right control buttons.
     /// Two lines: at `button_x_start + button_width` (minimize|maximize) and
-    /// at `button_x_start + button_width * 2` (maximize|close). Each line walks
-    /// from vertical centre toward the squircle and stops when the pixel under
-    /// it changes colour (i.e. when it hits the corner mask).
+    /// at `button_x_start + button_width * 2` (maximize|close). Each line walks from vertical centre toward the squircle and stops when the pixel under it changes colour (i.e. when it hits the corner mask).
     pub fn draw_button_hairlines(
         pixels: &mut [u32],
         hit_test_map: &mut [u8],
@@ -601,11 +596,7 @@ impl PlotypusApp {
         }
     }
 
-    /// Apply hover tint to every pixel of the hovered window-control button by
-    /// scanning the hit-test map and `wrapping_add`'ing the theme delta. Photon's
-    /// `draw_button_hover_by_pixels` algorithm — deltas are tuned to produce
-    /// the right brightening when each channel wraps, applied uniformly to bg,
-    /// edges, and glyph alike.
+    /// Apply hover tint to every pixel of the hovered window-control button by scanning the hit-test map and `wrapping_add`'ing the theme delta. Photon's `draw_button_hover_by_pixels` algorithm — deltas are tuned to produce the right brightening when each channel wraps, applied uniformly to bg, edges, and glyph alike.
     pub fn apply_window_control_hover(
         pixels: &mut [u32],
         hit_test_map: &[u8],

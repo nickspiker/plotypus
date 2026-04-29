@@ -1,16 +1,12 @@
 //! Linux renderer — softbuffer with CPU buffer for Wayland triple-buffering
 //!
-//! Wayland compositors rotate 2–3 buffers. You never get back the one you just
-//! sent, so partial updates leave stale regions. We keep a CPU-side copy of the
-//! full frame and use softbuffer's `buffer.age()` to know how far back each
-//! compositor buffer is, then copy the dirty union into it before presenting.
+//! Wayland compositors rotate 2–3 buffers. You never get back the one you just sent, so partial updates leave stale regions. We keep a CPU-side copy of the full frame and use softbuffer's `buffer.age()` to know how far back each compositor buffer is, then copy the dirty union into it before presenting.
 
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use winit::window::Window;
 
-/// Buffer guard — Deref gives you the CPU buffer.
-/// On present, dirty+stale strips are copied to the compositor buffer.
+/// Buffer guard — Deref gives you the CPU buffer. On present, dirty+stale strips are copied to the compositor buffer.
 pub struct SoftbufferBuffer<'a> {
     inner: &'a mut Renderer,
 }
@@ -52,8 +48,7 @@ pub struct Renderer {
     dirty_y_min: u32,
     /// Largest y touched since last present (exclusive)
     dirty_y_max: u32,
-    /// Ring of (y_min, y_max) for the last N presents, so we can replay
-    /// the dirty union for any buffer age the compositor hands back.
+    /// Ring of (y_min, y_max) for the last N presents, so we can replay the dirty union for any buffer age the compositor hands back.
     history: [(u32, u32); 4],
     history_idx: usize,
 }
@@ -118,8 +113,7 @@ impl Renderer {
         let mut buffer = self.surface.buffer_mut().map_err(|_| ())?;
         let age = buffer.age();
 
-        // Determine copy range: union of current dirty + however many frames
-        // this buffer is behind.
+        // Determine copy range: union of current dirty + however many frames this buffer is behind.
         let (copy_min, copy_max) = if age == 0 {
             // Buffer never presented — full copy
             (0, self.height)

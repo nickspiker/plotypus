@@ -542,8 +542,7 @@ impl TextRenderer {
     }
 
     /// Draw left-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text
-    /// add_mode: true = add colour, false = subtract colour
+    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_left_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -593,8 +592,7 @@ impl TextRenderer {
     }
 
     /// Draw center-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text
-    /// add_mode: true = add colour, false = subtract colour
+    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_center_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -644,8 +642,7 @@ impl TextRenderer {
     }
 
     /// Draw right-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text
-    /// add_mode: true = add colour, false = subtract colour
+    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_right_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -774,11 +771,7 @@ impl TextRenderer {
     ) {
         // Calculate text width for centering
         let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run
-                .glyphs
-                .iter()
-                .map(|g| g.w)
-                .sum::<f32>();
+            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
             max_width.max(run_width)
         });
 
@@ -849,11 +842,7 @@ impl TextRenderer {
     ) {
         // Calculate text width for right-alignment
         let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run
-                .glyphs
-                .iter()
-                .map(|g| g.w)
-                .sum::<f32>();
+            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
             max_width.max(run_width)
         });
 
@@ -1096,8 +1085,7 @@ impl TextRenderer {
         }
     }
 
-    /// Render single character with additive/subtractive compositing (u32 ARGB version)
-    /// pixel += char_alpha * mask_alpha * brightness (or -= for subtract)
+    /// Render single character with additive/subtractive compositing (u32 ARGB version) pixel += char_alpha * mask_alpha * brightness (or -= for subtract)
     pub fn render_char_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -1155,9 +1143,11 @@ impl TextRenderer {
                             // WHY: Glyph can be partially off-screen when textbox is scrolled
                             // PROOF: final_x/final_y are i32, can be negative or exceed bounds
                             // PREVENTS: Index out of bounds panic on wrapped negative values
-                            if final_x < 0 || final_y < 0
+                            if final_x < 0
+                                || final_y < 0
                                 || final_x as usize >= width
-                                || final_y as usize >= height {
+                                || final_y as usize >= height
+                            {
                                 continue;
                             }
                             let idx = final_y as usize * width + final_x as usize;

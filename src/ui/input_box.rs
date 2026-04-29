@@ -1,10 +1,6 @@
 //! Formula input box, lifted from Photon's textbox pattern.
 //!
-//! `TextState` caches per-char pixel widths so the blinkey position and
-//! horizontal layout never disagree with cosmic-text shaping. Glyphs and the
-//! blinkey wave are composited additively (`wrapping_add` / `wrapping_sub`),
-//! which lets the diff renderer subtract the previous frame's text+blinkey and
-//! add the new ones without re-drawing the input box bg or frame.
+//! `TextState` caches per-char pixel widths so the blinkey position and horizontal layout never disagree with cosmic-text shaping. Glyphs and the blinkey wave are composited additively (`wrapping_add` / `wrapping_sub`), which lets the diff renderer subtract the previous frame's text+blinkey and add the new ones without re-drawing the input box bg or frame.
 
 use crate::ui::compositing::HIT_INPUT_BOX;
 use crate::ui::plot::Rect;
@@ -23,7 +19,9 @@ pub struct TextState {
 }
 
 impl TextState {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn cursor_offset(&self) -> usize {
         self.widths[..self.blinkey_index].iter().sum()
@@ -37,7 +35,9 @@ impl TextState {
     }
 
     pub fn delete_forward(&mut self) -> bool {
-        if self.blinkey_index >= self.chars.len() { return false; }
+        if self.blinkey_index >= self.chars.len() {
+            return false;
+        }
         let w = self.widths[self.blinkey_index];
         self.chars.remove(self.blinkey_index);
         self.widths.remove(self.blinkey_index);
@@ -46,7 +46,9 @@ impl TextState {
     }
 
     pub fn delete_backward(&mut self) -> bool {
-        if self.blinkey_index == 0 { return false; }
+        if self.blinkey_index == 0 {
+            return false;
+        }
         self.blinkey_index -= 1;
         let w = self.widths[self.blinkey_index];
         self.chars.remove(self.blinkey_index);
@@ -56,25 +58,33 @@ impl TextState {
     }
 
     pub fn move_left(&mut self) -> bool {
-        if self.blinkey_index == 0 { return false; }
+        if self.blinkey_index == 0 {
+            return false;
+        }
         self.blinkey_index -= 1;
         true
     }
 
     pub fn move_right(&mut self) -> bool {
-        if self.blinkey_index >= self.chars.len() { return false; }
+        if self.blinkey_index >= self.chars.len() {
+            return false;
+        }
         self.blinkey_index += 1;
         true
     }
 
     pub fn home(&mut self) -> bool {
-        if self.blinkey_index == 0 { return false; }
+        if self.blinkey_index == 0 {
+            return false;
+        }
         self.blinkey_index = 0;
         true
     }
 
     pub fn end(&mut self) -> bool {
-        if self.blinkey_index == self.chars.len() { return false; }
+        if self.blinkey_index == self.chars.len() {
+            return false;
+        }
         self.blinkey_index = self.chars.len();
         true
     }
@@ -118,13 +128,21 @@ impl InputLayout {
 pub fn measure_char_width(tr: &mut TextRenderer, ch: char, font_size: f32) -> usize {
     let mut s = String::new();
     s.push(ch);
-    tr.measure_text_width(&s, font_size, theme::FONT_WEIGHT_USER_CONTENT, theme::FONT_USER_CONTENT)
-        as usize
+    tr.measure_text_width(
+        &s,
+        font_size,
+        theme::FONT_WEIGHT_USER_CONTENT,
+        theme::FONT_USER_CONTENT,
+    ) as usize
 }
 
 /// Re-measure every char's width (call after font_size changes — e.g., on resize).
 pub fn recompute_widths(text: &mut TextState, tr: &mut TextRenderer, font_size: f32) {
-    let widths: Vec<usize> = text.chars.iter().map(|&c| measure_char_width(tr, c, font_size)).collect();
+    let widths: Vec<usize> = text
+        .chars
+        .iter()
+        .map(|&c| measure_char_width(tr, c, font_size))
+        .collect();
     text.width = widths.iter().sum();
     text.widths = widths;
     if text.blinkey_index > text.chars.len() {
@@ -148,9 +166,7 @@ pub fn index_from_x(text: &TextState, layout: &InputLayout, click_x: f32) -> usi
     text.chars.len()
 }
 
-/// Draw bg + frame + prompt and (re)write the textbox mask in the input rect.
-/// Called on full redraws only. Does NOT draw text or blinkey — those are added
-/// additively afterwards.
+/// Draw bg + frame + prompt and (re)write the textbox mask in the input rect. Called on full redraws only. Does NOT draw text or blinkey — those are added additively afterwards.
 pub fn draw_chrome(
     pixels: &mut [u32],
     hit_test_map: &mut [u8],
@@ -161,7 +177,14 @@ pub fn draw_chrome(
     layout: &InputLayout,
     text_renderer: &mut TextRenderer,
 ) {
-    fill(pixels, hit_test_map, mask, window_width, rect, theme::TEXTBOX_FILL);
+    fill(
+        pixels,
+        hit_test_map,
+        mask,
+        window_width,
+        rect,
+        theme::TEXTBOX_FILL,
+    );
     let (light, shadow) = if focused {
         (0xFF_8A_82_6B, theme::TEXTBOX_SHADOW_EDGE)
     } else {
@@ -188,8 +211,7 @@ pub fn measure_prompt_width(tr: &mut TextRenderer, font_size: f32) -> f32 {
     tr.measure_text_width(PROMPT, font_size, 500, theme::FONT_UI)
 }
 
-/// Add (or subtract) every char of `text` additively. Reversible — calling once
-/// with `add_mode = true` and once with `add_mode = false` cancels out exactly.
+/// Add (or subtract) every char of `text` additively. Reversible — calling once with `add_mode = true` and once with `add_mode = false` cancels out exactly.
 pub fn render_text(
     pixels: &mut [u32],
     text_renderer: &mut TextRenderer,
@@ -223,9 +245,7 @@ pub fn render_text(
 }
 
 /// Photon's blinkey: a vertical "comet" of brightness with a horizontal glow
-/// falling off as `1 / 2^|x|`. Two variants — `top_bright` true means the bright
-/// half is at the top of the wave, false at the bottom — picked at random per
-/// blink so the cursor visually shimmers.
+/// falling off as `1 / 2^|x|`. Two variants — `top_bright` true means the bright half is at the top of the wave, false at the bottom — picked at random per blink so the cursor visually shimmers.
 pub fn render_blinkey(
     pixels: &mut [u32],
     window_width: usize,
@@ -270,14 +290,7 @@ pub fn render_blinkey(
     }
 }
 
-fn fill(
-    pixels: &mut [u32],
-    hit: &mut [u8],
-    mask: &mut [u8],
-    width: usize,
-    r: Rect,
-    colour: u32,
-) {
+fn fill(pixels: &mut [u32], hit: &mut [u8], mask: &mut [u8], width: usize, r: Rect, colour: u32) {
     for y in r.y..r.y + r.h {
         let row = y * width;
         for x in r.x..r.x + r.w {

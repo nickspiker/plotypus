@@ -1,18 +1,17 @@
-//! Mouse + keyboard handlers for chrome interactions.
-//! Lifted concept from Photon's mouse.rs/keyboard.rs but trimmed to what Plotypus needs:
+//! Mouse + keyboard handlers for chrome interactions. Lifted concept from Photon's mouse.rs/keyboard.rs but trimmed to what Plotypus needs:
 //! - Window-control button click + hover
 //! - Edge-resize detection + cursor shape feedback
 //! - Body drag (delegates to winit::Window::drag_window)
 //! - Ctrl+D / Ctrl+H / Ctrl+T debug toggles
 //! - Ctrl/Cmd +/- zoom
 
+use crate::DEBUG_ENABLED;
 use crate::ui::app::{HoveredButton, PlotDragMode, PlotypusApp, ResizeEdge};
 use crate::ui::compositing::{
     HIT_BODY, HIT_CLOSE_BUTTON, HIT_INPUT_BOX, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
     HIT_PLOT_AREA,
 };
 use crate::ui::input_box::{index_from_x, measure_char_width};
-use crate::DEBUG_ENABLED;
 use std::sync::atomic::Ordering;
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -31,9 +30,13 @@ pub enum ClickAction {
 #[inline]
 pub fn zoom_modifier(mods: &ModifiersState) -> bool {
     #[cfg(target_os = "macos")]
-    { mods.super_key() }
+    {
+        mods.super_key()
+    }
     #[cfg(not(target_os = "macos"))]
-    { mods.control_key() }
+    {
+        mods.control_key()
+    }
 }
 
 pub enum KeyAction {
@@ -48,14 +51,8 @@ impl PlotypusApp {
         self.modifiers = mods;
     }
 
-    /// Decide what a left-mouse-down at the current cursor position should do.
-    /// Caller owns the window and performs the action; this keeps PlotypusApp
-    /// independent of the winit::Window handle.
-    pub fn handle_mouse_click(
-        &mut self,
-        state: ElementState,
-        button: MouseButton,
-    ) -> ClickAction {
+    /// Decide what a left-mouse-down at the current cursor position should do. Caller owns the window and performs the action; this keeps PlotypusApp independent of the winit::Window handle.
+    pub fn handle_mouse_click(&mut self, state: ElementState, button: MouseButton) -> ClickAction {
         if button != MouseButton::Left {
             return ClickAction::None;
         }
@@ -106,8 +103,7 @@ impl PlotypusApp {
         }
     }
 
-    /// Update hover state and cursor icon in response to mouse motion.
-    /// Returns true if a redraw is needed (hover changed).
+    /// Update hover state and cursor icon in response to mouse motion. Returns true if a redraw is needed (hover changed).
     pub fn handle_mouse_move(&mut self, window: &Window, x: f32, y: f32) -> bool {
         self.mouse_x = x;
         self.mouse_y = y;
@@ -204,13 +200,9 @@ impl PlotypusApp {
         }
 
         let zoom_mod = zoom_modifier(&self.modifiers);
-        // Any "command-class" modifier blocks text input so chord shortcuts
-        // (Ctrl+D, Alt+anything reserved for future bindings, Cmd on Mac) are
-        // never swallowed by the focused textbox. Shift is not a command
-        // modifier — Shift+letter still types a capital letter.
-        let any_cmd_mod = self.modifiers.control_key()
-            || self.modifiers.alt_key()
-            || self.modifiers.super_key();
+        // Any "command-class" modifier blocks text input so chord shortcuts (Ctrl+D, Alt+anything reserved for future bindings, Cmd on Mac) are never swallowed by the focused textbox. Shift is not a command modifier — Shift+letter still types a capital letter.
+        let any_cmd_mod =
+            self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
 
         if !any_cmd_mod && self.text_state.focused {
             if let Some(action) = self.handle_input_text(&event) {
@@ -261,8 +253,7 @@ impl PlotypusApp {
         KeyAction::None
     }
 
-    /// Handle a key as formula-input editing. Returns `Some(KeyAction)` if the
-    /// key was consumed, `None` to let the outer handler keep dispatching.
+    /// Handle a key as formula-input editing. Returns `Some(KeyAction)` if the key was consumed, `None` to let the outer handler keep dispatching.
     fn handle_input_text(&mut self, event: &KeyEvent) -> Option<KeyAction> {
         let mut changed = false;
         match &event.logical_key {
@@ -312,9 +303,7 @@ impl PlotypusApp {
         }
     }
 
-    /// Focus the textbox and place the cursor at the click x. Reuses the cached
-    /// last_layout from the most recent full draw so cursor placement matches
-    /// the rendered layout exactly.
+    /// Focus the textbox and place the cursor at the click x. Reuses the cached last_layout from the most recent full draw so cursor placement matches the rendered layout exactly.
     pub fn focus_textbox_at(&mut self, click_x: f32) {
         let was_focused = self.text_state.focused;
         self.text_state.focused = true;

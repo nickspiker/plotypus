@@ -3,8 +3,8 @@
 //! Queries the display's ICC profile and converts VSF RGB to display colorspace.
 
 use icc_profile::{Data, DecodedICCProfile, ICCNumber};
-use vsf::colour::convert::apply_matrix_3x3_f32;
 use vsf::colour::VSF_RGB2XYZ;
+use vsf::colour::convert::apply_matrix_3x3_f32;
 
 /// Display color converter
 pub struct DisplayConverter {
@@ -126,8 +126,7 @@ impl DisplayConverter {
             let g = apply_trc(display_lin[1], &self.g_trc);
             let b = apply_trc(display_lin[2], &self.b_trc);
 
-            // Android uses ABGR surface format, swap R↔B at load time
-            // so draw_avatar's ARGB writes become ABGR
+            // Android uses ABGR surface format, swap R↔B at load time so draw_avatar's ARGB writes become ABGR
             #[cfg(target_os = "android")]
             {
                 output[idx] = b;
@@ -253,10 +252,7 @@ fn apply_trc(linear: f32, trc: &TrcCurve) -> u8 {
 
 /// Invert a 3×3 matrix (column-major format)
 fn invert_3x3(m: &[f32; 9]) -> [f32; 9] {
-    // For column-major: m[col*3 + row]
-    // m[0],m[1],m[2] = column 0
-    // m[3],m[4],m[5] = column 1
-    // m[6],m[7],m[8] = column 2
+    // For column-major: m[col*3 + row] m[0],m[1],m[2] = column 0 m[3],m[4],m[5] = column 1 m[6],m[7],m[8] = column 2
 
     let a = m[0];
     let b = m[3];
@@ -355,9 +351,9 @@ fn get_display_profile() -> Option<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn get_display_profile() -> Option<Vec<u8>> {
-    use windows::core::PWSTR;
     use windows::Win32::Graphics::Gdi::GetDC;
     use windows::Win32::UI::ColorSystem::GetICMProfileW;
+    use windows::core::PWSTR;
 
     unsafe {
         let hdc = GetDC(None);

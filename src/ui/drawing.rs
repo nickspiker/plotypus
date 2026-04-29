@@ -6,9 +6,7 @@ use super::theme;
 
 /// Photon's signature animated background texture
 ///
-/// Creates a symmetric procedural texture with organic noise patterns.
-/// The `fullscreen` parameter controls whether edge pixels are drawn
-/// (false = leave 1px border for window edges on desktop).
+/// Creates a symmetric procedural texture with organic noise patterns. The `fullscreen` parameter controls whether edge pixels are drawn (false = leave 1px border for window edges on desktop).
 ///
 /// # Arguments
 /// * `pixels` - ARGB pixel buffer (0xAARRGGBB format)
@@ -90,7 +88,9 @@ fn draw_background_row(
     // PROOF: wrapping_sub produces consistent hash for any scroll position
     // PREVENTS: Different behavior for negative vs positive row indices
     let mut rng: usize = (0xDEADBEEF01234567)
-        ^ ((logical_row as usize).wrapping_sub(height / 2).wrapping_mul(0x9E3779B94517B397));
+        ^ ((logical_row as usize)
+            .wrapping_sub(height / 2)
+            .wrapping_mul(0x9E3779B94517B397));
     let mask = theme::BG_MASK;
     let alpha = theme::BG_ALPHA;
     let ones = 0x00010101;
@@ -114,7 +114,9 @@ fn draw_background_row(
 
     // Left half: right-to-left (mirror)
     rng = 0xDEADBEEF01234567
-        ^ ((logical_row as usize).wrapping_sub(height / 2).wrapping_mul(0x9E3779B94517B397));
+        ^ ((logical_row as usize)
+            .wrapping_sub(height / 2)
+            .wrapping_mul(0x9E3779B94517B397));
     colour = rng as u32 & mask | alpha;
 
     for x in (x_start..width / 2).rev() {

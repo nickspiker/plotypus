@@ -37,9 +37,7 @@ impl ApplicationHandler<PlotypusEvent> for App {
         let x = (screen.width.saturating_sub(win_w)) / 2;
         let y = (screen.height.saturating_sub(win_h)) / 2;
 
-        // TODO(macos): with_resizable(false) blocks winit's drag_resize_window.
-        //              Need to lift Photon's manual resize tracking — see
-        //              mouse.rs::apply_resize + main.rs::poll_macos_resize there.
+        // TODO(macos): with_resizable(false) blocks winit's drag_resize_window. Need to lift Photon's manual resize tracking — see mouse.rs::apply_resize + main.rs::poll_macos_resize there.
         let attrs = Window::default_attributes()
             .with_title("Plotypus")
             .with_inner_size(PhysicalSize::new(win_w, win_h))
@@ -145,7 +143,9 @@ impl ApplicationHandler<PlotypusEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(app) = self.plotypus_app.as_mut() else { return; };
+        let Some(app) = self.plotypus_app.as_mut() else {
+            return;
+        };
         if app.text_state.focused {
             let now = std::time::Instant::now();
             if now >= app.next_blink_time {
@@ -173,7 +173,9 @@ fn resize_edge_to_direction(edge: ResizeEdge) -> Option<ResizeDirection> {
 }
 
 fn main() {
-    let event_loop = EventLoop::<PlotypusEvent>::with_user_event().build().unwrap();
+    let event_loop = EventLoop::<PlotypusEvent>::with_user_event()
+        .build()
+        .unwrap();
     let event_proxy = event_loop.create_proxy();
 
     let mut app = App {

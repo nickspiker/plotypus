@@ -1,7 +1,6 @@
 //! macOS renderer — softbuffer (direct CPU buffer via Core Graphics)
 //!
-//! The compositor gets a direct pointer to our pixel buffer.
-//! Single-pixel read/write with zero copy overhead.
+//! The compositor gets a direct pointer to our pixel buffer. Single-pixel read/write with zero copy overhead.
 
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
@@ -48,8 +47,7 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(window: &Window, width: u32, height: u32) -> Self {
-        // SAFETY: The surface lives inside Renderer, which is owned by PhotonApp.
-        // PhotonApp is dropped before Window is dropped in main.rs.
+        // SAFETY: The surface lives inside Renderer, which is owned by PhotonApp. PhotonApp is dropped before Window is dropped in main.rs.
         let static_window: &'static Window = unsafe { std::mem::transmute(window) };
 
         let context = Context::new(static_window).unwrap();

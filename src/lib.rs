@@ -16,5 +16,4 @@ macro_rules! debug_println {
     };
 }
 
-pub static DEBUG_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

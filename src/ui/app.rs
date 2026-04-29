@@ -1,14 +1,13 @@
-use crate::ui::compositing::{
-    HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
-};
+use crate::ui::compositing::{HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON};
 use crate::ui::input_box::{
-    self, draw_chrome, recompute_widths, render_blinkey, render_text, InputLayout, TextState,
+    self, InputLayout, TextState, draw_chrome, recompute_widths, render_blinkey, render_text,
 };
-use crate::ui::plot::{draw_plot, screen_to_world, PlotView, Rect};
+use crate::ui::plot::{PlotView, Rect, draw_plot, screen_to_world};
 use crate::ui::renderer::Renderer;
 use crate::ui::text_rasterizing::TextRenderer;
 use crate::ui::{compositing, drawing, theme};
 use rand::Rng;
+use spirix::ScalarF4E3 as S43;
 use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize;
 use winit::keyboard::ModifiersState;
@@ -36,8 +35,8 @@ pub struct PlotDrag {
     pub start_x: f32,
     pub start_y: f32,
     /// World coords under the cursor when the drag started (for zoom anchoring).
-    pub anchor_world_x: f32,
-    pub anchor_world_y: f32,
+    pub anchor_world_x: S43,
+    pub anchor_world_y: S43,
     /// View bounds at the moment the drag started (for zoom — pan integrates incrementally).
     pub start_view: PlotView,
     /// Last-frame cursor position for incremental pan deltas.
@@ -91,24 +90,17 @@ pub struct PlotypusApp {
 
     // Formula input state — the source of truth for what the user has typed.
     pub text_state: TextState,
-    /// Snapshot of `text_state` reflecting what is currently composited into
-    /// `cpu_buffer`. Differential render subtracts using this then adds using
-    /// `text_state`, then assigns this := text_state.
+    /// Snapshot of `text_state` reflecting what is currently composited into `cpu_buffer`. Differential render subtracts using this then adds using `text_state`, then assigns this := text_state.
     pub last_text_state: TextState,
-    /// Snapshot of the InputLayout used to draw `last_text_state` — needed so a
-    /// resize can subtract from the *old* coordinates before the new layout is
-    /// applied.
+    /// Snapshot of the InputLayout used to draw `last_text_state` — needed so a resize can subtract from the *old* coordinates before the new layout is applied.
     pub last_layout: Option<InputLayout>,
-    /// Single-channel mask (window-sized) marking the inside of the input box,
-    /// used by `render_char_additive_u32` to clip glyphs to the textbox.
+    /// Single-channel mask (window-sized) marking the inside of the input box, used by `render_char_additive_u32` to clip glyphs to the textbox.
     pub textbox_mask: Vec<u8>,
     /// Set when text_state diverges from last_text_state (insert/delete/move).
     pub text_dirty: bool,
     /// Whether the blinkey is currently composited in `cpu_buffer`.
     pub blinkey_visible: bool,
-    /// Random per-blink orientation: true = bright at the top of the wave. Set
-    /// fresh on every ON-event, kept stable across the matching OFF-event so
-    /// subtraction cancels the prior addition exactly.
+    /// Random per-blink orientation: true = bright at the top of the wave. Set fresh on every ON-event, kept stable across the matching OFF-event so subtraction cancels the prior addition exactly.
     pub blinkey_top_bright: bool,
     /// Last blinkey position composited into `cpu_buffer` (for subtraction).
     pub last_blinkey_x: usize,
@@ -177,8 +169,7 @@ impl PlotypusApp {
         }
     }
 
-    /// Begin a pan or zoom drag anchored at the given screen position. Returns
-    /// false if the position is outside the plot rect (caller should not start).
+    /// Begin a pan or zoom drag anchored at the given screen position. Returns false if the position is outside the plot rect (caller should not start).
     pub fn start_plot_drag(&mut self, mode: PlotDragMode, x: f32, y: f32) -> bool {
         let (_, plot_rect) = Self::compute_layout(self.width, self.height, self.button_height());
         if !point_in_rect(plot_rect, x, y) {
@@ -198,19 +189,20 @@ impl PlotypusApp {
         true
     }
 
-    /// Apply the cursor's current position to the active drag. Returns true if
-    /// the view changed and a redraw is needed.
+    /// Apply the cursor's current position to the active drag. Returns true if the view changed and a redraw is needed.
     pub fn update_plot_drag(&mut self, x: f32, y: f32) -> bool {
         let btn_h = self.button_height();
         let (_, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
-        let Some(drag) = self.plot_drag.as_mut() else { return false; };
+        let Some(drag) = self.plot_drag.as_mut() else {
+            return false;
+        };
         match drag.mode {
             PlotDragMode::Pan => {
                 let dx = x - drag.last_x;
                 let dy = y - drag.last_y;
                 let view = self.plot_view;
-                let wpx = (view.x_max - view.x_min) / plot_rect.w as f32;
-                let wpy = (view.y_max - view.y_min) / plot_rect.h as f32;
+                let wpx = (view.x_max - view.x_min) / plot_rect.w;
+                let wpy = (view.y_max - view.y_min) / plot_rect.h;
                 self.plot_view.x_min -= dx * wpx;
                 self.plot_view.x_max -= dx * wpx;
                 self.plot_view.y_min += dy * wpy;
@@ -220,24 +212,19 @@ impl PlotypusApp {
             }
             PlotDragMode::Zoom => {
                 const SENS: f32 = 0.005;
-                const MIN_RANGE: f32 = 1e-30;
                 let dx = x - drag.start_x;
                 let dy = y - drag.start_y;
                 let factor_x = (-dx * SENS).exp();
                 let factor_y = (dy * SENS).exp();
                 let sv = drag.start_view;
-                let new_x_min = drag.anchor_world_x - (drag.anchor_world_x - sv.x_min) * factor_x;
-                let new_x_max = drag.anchor_world_x + (sv.x_max - drag.anchor_world_x) * factor_x;
-                let new_y_min = drag.anchor_world_y - (drag.anchor_world_y - sv.y_min) * factor_y;
-                let new_y_max = drag.anchor_world_y + (sv.y_max - drag.anchor_world_y) * factor_y;
-                if new_x_max - new_x_min > MIN_RANGE {
-                    self.plot_view.x_min = new_x_min;
-                    self.plot_view.x_max = new_x_max;
-                }
-                if new_y_max - new_y_min > MIN_RANGE {
-                    self.plot_view.y_min = new_y_min;
-                    self.plot_view.y_max = new_y_max;
-                }
+                self.plot_view.x_min =
+                    drag.anchor_world_x - (drag.anchor_world_x - sv.x_min) * factor_x;
+                self.plot_view.x_max =
+                    drag.anchor_world_x + (sv.x_max - drag.anchor_world_x) * factor_x;
+                self.plot_view.y_min =
+                    drag.anchor_world_y - (drag.anchor_world_y - sv.y_min) * factor_y;
+                self.plot_view.y_max =
+                    drag.anchor_world_y + (sv.y_max - drag.anchor_world_y) * factor_y;
             }
         }
         self.window_dirty = true;
@@ -252,9 +239,7 @@ impl PlotypusApp {
         (self.span / 32.0 * self.ru).ceil() as usize
     }
 
-    /// Compute the input-box and plot rectangles from window dims and chrome bar height.
-    /// Layout: chrome row at the top (where the window controls live), then a margin,
-    /// then a one-line input row, then the plot fills the rest down to the bottom margin.
+    /// Compute the input-box and plot rectangles from window dims and chrome bar height. Layout: chrome row at the top (where the window controls live), then a margin, then a one-line input row, then the plot fills the rest down to the bottom margin.
     pub fn compute_layout(width: u32, height: u32, button_height: usize) -> (Rect, Rect) {
         let w = width as usize;
         let h = height as usize;
@@ -272,8 +257,18 @@ impl PlotypusApp {
         let plot_h = h.saturating_sub(plot_y + margin);
 
         (
-            Rect { x: input_x, y: input_y, w: input_w, h: input_h },
-            Rect { x: plot_x, y: plot_y, w: plot_w, h: plot_h },
+            Rect {
+                x: input_x,
+                y: input_y,
+                w: input_w,
+                h: input_h,
+            },
+            Rect {
+                x: plot_x,
+                y: plot_y,
+                w: plot_w,
+                h: plot_h,
+            },
         )
     }
 
@@ -300,9 +295,7 @@ impl PlotypusApp {
         }
     }
 
-    /// Hit-test a pixel position. Returns `HIT_NONE` for non-finite coords (e.g.
-    /// the `f32::NAN` sentinel before the first cursor event) and for any
-    /// position outside the window.
+    /// Hit-test a pixel position. Returns `HIT_NONE` for non-finite coords (e.g. the `f32::NAN` sentinel before the first cursor event) and for any position outside the window.
     pub fn hit_test(&self, x: f32, y: f32) -> u8 {
         if !x.is_finite() || !y.is_finite() {
             return compositing::HIT_NONE;
@@ -370,8 +363,7 @@ impl PlotypusApp {
     }
 
     /// Three-flag gate: whether this frame needs a full-screen redraw.
-    /// Mirrors Photon's `window_dirty || debug_hit_test || show_textbox_mask` pattern.
-    /// Buffer-guard mark methods are no-ops — real dirty tracking lives on `self.renderer`.
+    /// Mirrors Photon's `window_dirty || debug_hit_test || show_textbox_mask` pattern. Buffer-guard mark methods are no-ops — real dirty tracking lives on `self.renderer`.
     fn needs_full_redraw(&self) -> bool {
         self.window_dirty || self.debug_hit_test || self.show_textbox_mask
     }
@@ -400,9 +392,7 @@ impl PlotypusApp {
             *h = compositing::HIT_BODY;
         }
 
-        // Pre-mark the renderer dirty BEFORE locking the buffer.
-        // The SoftbufferBuffer guard's mark_* methods are no-ops; only Renderer::mark_*
-        // updates the dirty_y_min/max range that present_frame uses to copy rows.
+        // Pre-mark the renderer dirty BEFORE locking the buffer. The SoftbufferBuffer guard's mark_* methods are no-ops; only Renderer::mark_* updates the dirty_y_min/max range that present_frame uses to copy rows.
         self.renderer.mark_all();
 
         let mut buffer = self.renderer.lock_buffer();
@@ -410,13 +400,8 @@ impl PlotypusApp {
 
         drawing::draw_background_texture(pixels, width, height, speckle, fullscreen, 0);
 
-        let (start, crossings, btn_x, btn_h) = Self::draw_window_controls(
-            pixels,
-            &mut self.hit_test_map,
-            self.width,
-            self.height,
-            ru,
-        );
+        let (start, crossings, btn_x, btn_h) =
+            Self::draw_window_controls(pixels, &mut self.hit_test_map, self.width, self.height, ru);
 
         if !fullscreen {
             Self::draw_window_edges_and_mask(
@@ -429,19 +414,10 @@ impl PlotypusApp {
             );
         }
 
-        // Hairlines between min|max and max|close, walked from centre until each
-        // hits the squircle. Must come after edges_and_mask so the colour-change
-        // detection terminates at the right pixel.
-        Self::draw_button_hairlines(
-            pixels,
-            &mut self.hit_test_map,
-            self.width,
-            btn_x,
-            btn_h,
-        );
+        // Hairlines between min|max and max|close, walked from centre until each hits the squircle. Must come after edges_and_mask so the colour-change detection terminates at the right pixel.
+        Self::draw_button_hairlines(pixels, &mut self.hit_test_map, self.width, btn_x, btn_h);
 
-        // Hover tint: scan hit_test_map for the hovered button's id and
-        // wrapping_add the theme delta to every matching pixel. Photon's pattern.
+        // Hover tint: scan hit_test_map for the hovered button's id and wrapping_add the theme delta to every matching pixel. Photon's pattern.
         let (hover_id, hover_delta) = match hovered {
             HoveredButton::Close => (HIT_CLOSE_BUTTON, theme::CLOSE_HOVER),
             HoveredButton::Maximize => (HIT_MAXIMIZE_BUTTON, theme::MAXIMIZE_HOVER),
@@ -453,12 +429,19 @@ impl PlotypusApp {
 
         let (input_rect, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
         if plot_rect.w > 4 && plot_rect.h > 4 {
-            draw_plot(pixels, &mut self.hit_test_map, width, plot_rect, self.plot_view);
+            let label_font_size = (btn_h as f32 * 0.5).max(10.0);
+            draw_plot(
+                pixels,
+                &mut self.hit_test_map,
+                &mut self.text_renderer,
+                width,
+                plot_rect,
+                self.plot_view,
+                label_font_size,
+            );
         }
 
-        // Input box: draw chrome (bg + frame + prompt), then additively render text
-        // and blinkey. Snapshot text_state + layout + blinkey position so the diff
-        // path can subtract them on the next text-only update.
+        // Input box: draw chrome (bg + frame + prompt), then additively render text and blinkey. Snapshot text_state + layout + blinkey position so the diff path can subtract them on the next text-only update.
         if input_rect.w > 4 && input_rect.h > 4 {
             let font_size = (input_rect.h as f32 * 0.55).max(12.0);
             let prompt_w = input_box::measure_prompt_width(&mut self.text_renderer, font_size);
@@ -548,9 +531,7 @@ impl PlotypusApp {
         self.window_dirty = false;
     }
 
-    /// Differential input box render: subtract last frame's text+blinkey from
-    /// `cpu_buffer`, then add the current ones. Marks only the input rect's
-    /// rows dirty so the chrome and plot stay untouched in the compositor.
+    /// Differential input box render: subtract last frame's text+blinkey from `cpu_buffer`, then add the current ones. Marks only the input rect's rows dirty so the chrome and plot stay untouched in the compositor.
     fn render_input_diff(&mut self) {
         let Some(layout) = self.last_layout else {
             // No previous full draw to diff against — escalate.
@@ -624,13 +605,14 @@ impl PlotypusApp {
         self.text_dirty = false;
     }
 
-    /// Toggle the blinkey on or off in `cpu_buffer`, schedule the next toggle.
-    /// Called from the event loop when `next_blink_time` is reached.
+    /// Toggle the blinkey on or off in `cpu_buffer`, schedule the next toggle. Called from the event loop when `next_blink_time` is reached.
     pub fn flip_blinkey(&mut self) {
         if !self.text_state.focused {
             return;
         }
-        let Some(layout) = self.last_layout else { return; };
+        let Some(layout) = self.last_layout else {
+            return;
+        };
         let width = self.width as usize;
         let rect = layout.rect;
 
@@ -675,18 +657,15 @@ impl PlotypusApp {
     }
 }
 
-/// Photon's blinkey blink rate: random 0–300 ms per toggle so neighbouring
-/// cursors in the same window don't sync up into a metronome.
+/// Photon's blinkey blink rate: random 0–300 ms per toggle so neighbouring cursors in the same window don't sync up into a metronome.
 fn next_blink_wake() -> Instant {
     let ms = rand::thread_rng().gen_range(0..=300);
     Instant::now() + Duration::from_millis(ms)
 }
 
+
 fn point_in_rect(r: Rect, x: f32, y: f32) -> bool {
     let xi = x as i32;
     let yi = y as i32;
-    xi >= r.x as i32
-        && xi < (r.x + r.w) as i32
-        && yi >= r.y as i32
-        && yi < (r.y + r.h) as i32
+    xi >= r.x as i32 && xi < (r.x + r.w) as i32 && yi >= r.y as i32 && yi < (r.y + r.h) as i32
 }
