@@ -4,7 +4,7 @@ use plotypus::ui::{PlotypusApp, PlotypusEvent};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Fullscreen, ResizeDirection, Window, WindowId};
 
 struct App {
@@ -144,7 +144,18 @@ impl ApplicationHandler<PlotypusEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(app) = self.plotypus_app.as_mut() else { return; };
+        if app.text_state.focused {
+            let now = std::time::Instant::now();
+            if now >= app.next_blink_time {
+                app.flip_blinkey();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(app.next_blink_time));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
 }
 
 fn resize_edge_to_direction(edge: ResizeEdge) -> Option<ResizeDirection> {

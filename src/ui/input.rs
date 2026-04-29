@@ -6,10 +6,12 @@
 //! - Ctrl+D / Ctrl+H / Ctrl+T debug toggles
 //! - Ctrl/Cmd +/- zoom
 
-use crate::ui::app::{HoveredButton, PlotypusApp, ResizeEdge};
+use crate::ui::app::{HoveredButton, PlotDragMode, PlotypusApp, ResizeEdge};
 use crate::ui::compositing::{
-    HIT_BODY, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
+    HIT_BODY, HIT_CLOSE_BUTTON, HIT_INPUT_BOX, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
+    HIT_PLOT_AREA,
 };
+use crate::ui::input_box::{index_from_x, measure_char_width};
 use crate::DEBUG_ENABLED;
 use std::sync::atomic::Ordering;
 use winit::event::{ElementState, KeyEvent, MouseButton};
@@ -23,6 +25,15 @@ pub enum ClickAction {
     ToggleFullscreen,
     DragWindow,
     DragResize(ResizeEdge),
+}
+
+/// Zoom-shortcut modifier: Cmd on macOS, Ctrl elsewhere. Same key used for `Ctrl+D/H/T/+/-/0`.
+#[inline]
+pub fn zoom_modifier(mods: &ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    { mods.super_key() }
+    #[cfg(not(target_os = "macos"))]
+    { mods.control_key() }
 }
 
 pub enum KeyAction {
@@ -63,7 +74,24 @@ impl PlotypusApp {
                     self.resize_edge = edge;
                     return ClickAction::DragResize(edge);
                 }
+                if hit == HIT_INPUT_BOX {
+                    self.focus_textbox_at(self.mouse_x);
+                    return ClickAction::None;
+                }
+                if hit == HIT_PLOT_AREA {
+                    self.defocus_textbox();
+                    if self.modifiers.alt_key() {
+                        self.start_plot_drag(PlotDragMode::Pan, self.mouse_x, self.mouse_y);
+                        return ClickAction::None;
+                    }
+                    if zoom_modifier(&self.modifiers) {
+                        self.start_plot_drag(PlotDragMode::Zoom, self.mouse_x, self.mouse_y);
+                        return ClickAction::None;
+                    }
+                    return ClickAction::DragWindow;
+                }
                 if hit == HIT_BODY {
+                    self.defocus_textbox();
                     return ClickAction::DragWindow;
                 }
                 ClickAction::None
@@ -72,6 +100,7 @@ impl PlotypusApp {
                 self.mouse_button_pressed = false;
                 self.is_dragging_resize = false;
                 self.resize_edge = ResizeEdge::None;
+                self.end_plot_drag();
                 ClickAction::None
             }
         }
@@ -82,6 +111,15 @@ impl PlotypusApp {
     pub fn handle_mouse_move(&mut self, window: &Window, x: f32, y: f32) -> bool {
         self.mouse_x = x;
         self.mouse_y = y;
+
+        if self.plot_drag.is_some() {
+            let cursor = match self.plot_drag.unwrap().mode {
+                PlotDragMode::Pan => CursorIcon::Grabbing,
+                PlotDragMode::Zoom => CursorIcon::AllScroll,
+            };
+            window.set_cursor(cursor);
+            return self.update_plot_drag(x, y);
+        }
 
         if !self.mouse_button_pressed {
             self.is_dragging_resize = false;
@@ -114,7 +152,7 @@ impl PlotypusApp {
 
         let cursor = if on_button {
             CursorIcon::Pointer
-        } else {
+        } else if edge != ResizeEdge::None {
             match edge {
                 ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
                 ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
@@ -122,6 +160,18 @@ impl PlotypusApp {
                 ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
                 ResizeEdge::None => CursorIcon::Default,
             }
+        } else if hit == HIT_PLOT_AREA {
+            if self.modifiers.alt_key() {
+                CursorIcon::Grab
+            } else if zoom_modifier(&self.modifiers) {
+                CursorIcon::ZoomIn
+            } else {
+                CursorIcon::Crosshair
+            }
+        } else if hit == HIT_INPUT_BOX {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
         };
         window.set_cursor(cursor);
 
@@ -153,10 +203,20 @@ impl PlotypusApp {
             return KeyAction::Exit;
         }
 
-        #[cfg(target_os = "macos")]
-        let zoom_mod = self.modifiers.super_key();
-        #[cfg(not(target_os = "macos"))]
-        let zoom_mod = self.modifiers.control_key();
+        let zoom_mod = zoom_modifier(&self.modifiers);
+        // Any "command-class" modifier blocks text input so chord shortcuts
+        // (Ctrl+D, Alt+anything reserved for future bindings, Cmd on Mac) are
+        // never swallowed by the focused textbox. Shift is not a command
+        // modifier — Shift+letter still types a capital letter.
+        let any_cmd_mod = self.modifiers.control_key()
+            || self.modifiers.alt_key()
+            || self.modifiers.super_key();
+
+        if !any_cmd_mod && self.text_state.focused {
+            if let Some(action) = self.handle_input_text(&event) {
+                return action;
+            }
+        }
 
         if zoom_mod {
             if let Key::Character(ref c) = event.logical_key {
@@ -199,5 +259,89 @@ impl PlotypusApp {
         }
 
         KeyAction::None
+    }
+
+    /// Handle a key as formula-input editing. Returns `Some(KeyAction)` if the
+    /// key was consumed, `None` to let the outer handler keep dispatching.
+    fn handle_input_text(&mut self, event: &KeyEvent) -> Option<KeyAction> {
+        let mut changed = false;
+        match &event.logical_key {
+            Key::Named(NamedKey::Backspace) => {
+                changed = self.text_state.delete_backward();
+            }
+            Key::Named(NamedKey::Delete) => {
+                changed = self.text_state.delete_forward();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                changed = self.text_state.move_left();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                changed = self.text_state.move_right();
+            }
+            Key::Named(NamedKey::Home) => {
+                changed = self.text_state.home();
+            }
+            Key::Named(NamedKey::End) => {
+                changed = self.text_state.end();
+            }
+            Key::Named(NamedKey::Enter) => {}
+            Key::Named(NamedKey::Space) => {
+                let font_size = self.input_font_size();
+                let w = measure_char_width(&mut self.text_renderer, ' ', font_size);
+                self.text_state.insert(' ', w);
+                changed = true;
+            }
+            Key::Character(c) => {
+                let font_size = self.input_font_size();
+                for ch in c.chars() {
+                    if ch.is_control() {
+                        continue;
+                    }
+                    let w = measure_char_width(&mut self.text_renderer, ch, font_size);
+                    self.text_state.insert(ch, w);
+                    changed = true;
+                }
+            }
+            _ => return None,
+        }
+        if changed {
+            self.text_dirty = true;
+            Some(KeyAction::Redraw)
+        } else {
+            Some(KeyAction::None)
+        }
+    }
+
+    /// Focus the textbox and place the cursor at the click x. Reuses the cached
+    /// last_layout from the most recent full draw so cursor placement matches
+    /// the rendered layout exactly.
+    pub fn focus_textbox_at(&mut self, click_x: f32) {
+        let was_focused = self.text_state.focused;
+        self.text_state.focused = true;
+        if let Some(layout) = self.last_layout {
+            let idx = index_from_x(&self.text_state, &layout, click_x);
+            self.text_state.blinkey_index = idx;
+        } else {
+            self.text_state.blinkey_index = self.text_state.chars.len();
+        }
+        if !was_focused {
+            // Frame colour changes — needs full redraw of input chrome.
+            self.window_dirty = true;
+        } else {
+            self.text_dirty = true;
+        }
+    }
+
+    pub fn defocus_textbox(&mut self) {
+        if self.text_state.focused {
+            self.text_state.focused = false;
+            self.window_dirty = true;
+        }
+    }
+
+    fn input_font_size(&self) -> f32 {
+        let btn_h = self.button_height();
+        let (input_rect, _) = PlotypusApp::compute_layout(self.width, self.height, btn_h);
+        (input_rect.h as f32 * 0.55).max(12.0)
     }
 }

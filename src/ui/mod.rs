@@ -4,6 +4,8 @@ pub mod compositing;
 pub mod display_profile;
 pub mod drawing;
 pub mod input;
+pub mod input_box;
+pub mod plot;
 pub mod text_rasterizing;
 pub mod theme;
 

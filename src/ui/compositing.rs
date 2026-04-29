@@ -9,6 +9,8 @@ pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
 pub const HIT_BODY: u8 = 4;
+pub const HIT_INPUT_BOX: u8 = 5;
+pub const HIT_PLOT_AREA: u8 = 6;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const PREMULTIPLIED: bool = true;
