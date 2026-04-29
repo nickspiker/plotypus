@@ -41,7 +41,131 @@ pub fn draw_plot(
 ) {
     fill_rect(pixels, hit_test_map, window_width, rect, theme::PLOT_BG, HIT_PLOT_AREA);
     draw_dyadic_grid(pixels, window_width, rect, view);
+    draw_test_curve(pixels, window_width, rect, view);
     draw_frame(pixels, window_width, rect, theme::PLOT_FRAME);
+}
+
+/// Hardcoded `y = sin(x · 2π) · 0.7` until the evaluator lands. The closure is
+/// the seam where a Spirix-evaluated `y = f(x)` will plug in.
+fn draw_test_curve(pixels: &mut [u32], window_width: usize, rect: Rect, view: PlotView) {
+    let curve = |x: f32| (x * std::f32::consts::TAU).sin() * 0.7;
+    draw_curve(pixels, window_width, rect, view, curve, theme::PLOT_CURVE);
+}
+
+/// 32×-supersampled curve renderer with sub-pixel-accurate vertical AA.
+///
+/// For each interior pixel column:
+///   1. Evaluate the curve at 32 centred sub-x positions (`(i + 0.5) / 32`
+///      across the column). Non-finite samples are dropped — `NaN`/`±inf`
+///      regions correctly leave a gap in the curve.
+///   2. Take the min and max of the finite subsample pixel-y values.
+///   3. Expand by ±0.5 px to give the curve a 1-px stroke baseline (so a flat
+///      line at fractional y still produces proper two-row AA, and steep
+///      slopes get proper boundary AA at the top/bottom).
+///   4. For every pixel row whose `[r, r+1]` extent overlaps the expanded
+///      span, alpha-blend the row by the overlap length (0..1).
+///
+/// Cost is `32 * rect.w` curve evaluations per frame — fine for f32 closures;
+/// tunable if Spirix evaluation gets expensive.
+pub fn draw_curve(
+    pixels: &mut [u32],
+    window_width: usize,
+    rect: Rect,
+    view: PlotView,
+    curve: impl Fn(f32) -> f32,
+    colour: u32,
+) {
+    const SUBSAMPLES: usize = 32;
+    /// Half-thickness of the curve in pixels — gives a 1-px-wide AA stroke
+    /// before slope-driven extent stretches it taller.
+    const STROKE_RADIUS: f32 = 0.5;
+
+    if rect.w < 3 || rect.h < 3 {
+        return;
+    }
+    let x_range = view.x_max - view.x_min;
+    let y_range = view.y_max - view.y_min;
+    if !(x_range > 0.0) || !(y_range > 0.0) {
+        return;
+    }
+
+    let interior_left = rect.x + 1;
+    let interior_right = rect.x + rect.w - 1;
+    let interior_top = (rect.y + 1) as f32;
+    let interior_bottom = (rect.y + rect.h - 1) as f32;
+    let row_top = (rect.y + 1) as i32;
+    let row_bot = (rect.y + rect.h - 2) as i32;
+
+    let inv_subsamples = 1.0 / SUBSAMPLES as f32;
+    let inv_y_range = 1.0 / y_range;
+    let inv_rect_w = 1.0 / rect.w as f32;
+
+    for px in interior_left..interior_right {
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut any_finite = false;
+
+        for i in 0..SUBSAMPLES {
+            let sub_x = px as f32 + (i as f32 + 0.5) * inv_subsamples;
+            let fx = (sub_x - rect.x as f32) * inv_rect_w;
+            let world_x = view.x_min + fx * x_range;
+            let world_y = curve(world_x);
+            if !world_y.is_finite() {
+                continue;
+            }
+            let fy = (world_y - view.y_min) * inv_y_range;
+            let pix_y = rect.y as f32 + (1.0 - fy) * rect.h as f32;
+            if pix_y < min_y { min_y = pix_y; }
+            if pix_y > max_y { max_y = pix_y; }
+            any_finite = true;
+        }
+
+        if !any_finite {
+            continue;
+        }
+
+        let lo = (min_y - STROKE_RADIUS).max(interior_top);
+        let hi = (max_y + STROKE_RADIUS).min(interior_bottom);
+        if hi <= lo {
+            continue;
+        }
+
+        let r_first = (lo.floor() as i32).max(row_top);
+        let r_last = (hi.ceil() as i32 - 1).min(row_bot);
+        for r in r_first..=r_last {
+            let row_y_top = r as f32;
+            let row_y_bot = row_y_top + 1.0;
+            let overlap = row_y_bot.min(hi) - row_y_top.max(lo);
+            if overlap <= 0.0 {
+                continue;
+            }
+            let intensity = (overlap * 256.0) as u32;
+            if intensity == 0 {
+                continue;
+            }
+            let idx = r as usize * window_width + px;
+            pixels[idx] = blend_colour_onto(pixels[idx], colour, intensity);
+        }
+    }
+}
+
+/// Linear blend of `fg` over `bg` with `intensity` in `0..=256`. Saturating
+/// behaviour at the endpoints — `intensity=0` gives `bg`, `intensity=256` gives
+/// `fg` (modulo the >>8 rounding). Mirrors `blend_white_onto`'s shape but with
+/// a non-white foreground.
+fn blend_colour_onto(bg: u32, fg: u32, intensity: u32) -> u32 {
+    let intensity = intensity.min(256);
+    let inv = 256 - intensity;
+    let bg_r = (bg >> 16) & 0xFF;
+    let bg_g = (bg >> 8) & 0xFF;
+    let bg_b = bg & 0xFF;
+    let fg_r = (fg >> 16) & 0xFF;
+    let fg_g = (fg >> 8) & 0xFF;
+    let fg_b = fg & 0xFF;
+    let r = (bg_r * inv + fg_r * intensity) >> 8;
+    let g = (bg_g * inv + fg_g * intensity) >> 8;
+    let b = (bg_b * inv + fg_b * intensity) >> 8;
+    0xFF000000 | (r << 16) | (g << 8) | b
 }
 
 /// World coords under a screen point inside the plot rect.

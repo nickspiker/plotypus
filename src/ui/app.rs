@@ -145,8 +145,8 @@ impl PlotypusApp {
             hit_test_map: vec![compositing::HIT_BODY; (width * height) as usize],
             ru: 1.0,
             span: compute_span(width, height),
-            mouse_x: -1.0,
-            mouse_y: -1.0,
+            mouse_x: f32::NAN,
+            mouse_y: f32::NAN,
             mouse_button_pressed: false,
             modifiers: ModifiersState::empty(),
             hovered_button: HoveredButton::None,
@@ -203,9 +203,6 @@ impl PlotypusApp {
     pub fn update_plot_drag(&mut self, x: f32, y: f32) -> bool {
         let btn_h = self.button_height();
         let (_, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
-        if plot_rect.w == 0 || plot_rect.h == 0 {
-            return false;
-        }
         let Some(drag) = self.plot_drag.as_mut() else { return false; };
         match drag.mode {
             PlotDragMode::Pan => {
@@ -303,12 +300,19 @@ impl PlotypusApp {
         }
     }
 
-    /// Hit-test a pixel position; out-of-bounds returns HIT_NONE.
-    pub fn hit_test(&self, x: i32, y: i32) -> u8 {
-        if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+    /// Hit-test a pixel position. Returns `HIT_NONE` for non-finite coords (e.g.
+    /// the `f32::NAN` sentinel before the first cursor event) and for any
+    /// position outside the window.
+    pub fn hit_test(&self, x: f32, y: f32) -> u8 {
+        if !x.is_finite() || !y.is_finite() {
             return compositing::HIT_NONE;
         }
-        let idx = y as usize * self.width as usize + x as usize;
+        let xi = x as i32;
+        let yi = y as i32;
+        if xi < 0 || yi < 0 || (xi as u32) >= self.width || (yi as u32) >= self.height {
+            return compositing::HIT_NONE;
+        }
+        let idx = yi as usize * self.width as usize + xi as usize;
         self.hit_test_map[idx]
     }
 

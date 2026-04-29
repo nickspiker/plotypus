@@ -62,7 +62,7 @@ impl PlotypusApp {
         match state {
             ElementState::Pressed => {
                 self.mouse_button_pressed = true;
-                let hit = self.hit_test(self.mouse_x as i32, self.mouse_y as i32);
+                let hit = self.hit_test(self.mouse_x, self.mouse_y);
                 match hit {
                     HIT_CLOSE_BUTTON => return ClickAction::Exit,
                     HIT_MINIMIZE_BUTTON => return ClickAction::Minimize,
@@ -125,7 +125,7 @@ impl PlotypusApp {
             self.is_dragging_resize = false;
         }
 
-        let hit = self.hit_test(x as i32, y as i32);
+        let hit = self.hit_test(x, y);
         let on_button = matches!(
             hit,
             HIT_CLOSE_BUTTON | HIT_MAXIMIZE_BUTTON | HIT_MINIMIZE_BUTTON

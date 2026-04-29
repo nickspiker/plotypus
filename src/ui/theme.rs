@@ -110,6 +110,7 @@ pub const BG_SPECKLE: u32 = fmt(0x00_3F_1F_7F); // Speckle highlight colour (no 
 // Plot region colours
 pub const PLOT_BG: u32 = fmt(0xFF_06_0A_0C);
 pub const PLOT_FRAME: u32 = fmt(0xFF_44_41_37);
+pub const PLOT_CURVE: u32 = fmt(0xFF_40_E0_E0);
 
 // Message colours
 pub const MESSAGE_SENT: u32 = fmt(0xFF_FF_A0_40); // Orange for outgoing messages
