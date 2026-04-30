@@ -6,10 +6,12 @@
 //! - Ctrl/Cmd +/- zoom
 
 use crate::DEBUG_ENABLED;
-use crate::ui::app::{HoveredButton, PlotDragMode, PlotypusApp, ResizeEdge};
+use crate::formula;
+use crate::ui::app::{FocusedBox, HoveredButton, PlotDragMode, PlotypusApp, ResizeEdge};
 use crate::ui::compositing::{
-    HIT_BODY, HIT_CLOSE_BUTTON, HIT_INPUT_BOX, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
-    HIT_PLOT_AREA,
+    HIT_BASE_BOX, HIT_BODY, HIT_CLOSE_BUTTON, HIT_INPUT_BOX, HIT_MAXIMIZE_BUTTON,
+    HIT_MINIMIZE_BUTTON, HIT_PLOT_AREA, HIT_RANGE_XMIN, HIT_RANGE_XMAX, HIT_RANGE_YMIN,
+    HIT_RANGE_YMAX,
 };
 use crate::ui::input_box::{index_from_x, measure_char_width};
 use std::sync::atomic::Ordering;
@@ -72,11 +74,26 @@ impl PlotypusApp {
                     return ClickAction::DragResize(edge);
                 }
                 if hit == HIT_INPUT_BOX {
+                    self.focus_box(FocusedBox::Formula);
                     self.focus_textbox_at(self.mouse_x);
                     return ClickAction::None;
                 }
+                if hit == HIT_BASE_BOX {
+                    self.focus_box(FocusedBox::Base);
+                    return ClickAction::None;
+                }
+                if let Some(fb) = match hit {
+                    HIT_RANGE_XMIN => Some(FocusedBox::RangeXMin),
+                    HIT_RANGE_XMAX => Some(FocusedBox::RangeXMax),
+                    HIT_RANGE_YMIN => Some(FocusedBox::RangeYMin),
+                    HIT_RANGE_YMAX => Some(FocusedBox::RangeYMax),
+                    _ => None,
+                } {
+                    self.focus_range_box(fb);
+                    return ClickAction::None;
+                }
                 if hit == HIT_PLOT_AREA {
-                    self.defocus_textbox();
+                    self.defocus_all();
                     if self.modifiers.alt_key() {
                         self.start_plot_drag(PlotDragMode::Pan, self.mouse_x, self.mouse_y);
                         return ClickAction::None;
@@ -88,7 +105,7 @@ impl PlotypusApp {
                     return ClickAction::DragWindow;
                 }
                 if hit == HIT_BODY {
-                    self.defocus_textbox();
+                    self.defocus_all();
                     return ClickAction::DragWindow;
                 }
                 ClickAction::None
@@ -164,7 +181,13 @@ impl PlotypusApp {
             } else {
                 CursorIcon::Crosshair
             }
-        } else if hit == HIT_INPUT_BOX {
+        } else if hit == HIT_INPUT_BOX
+            || hit == HIT_BASE_BOX
+            || hit == HIT_RANGE_XMIN
+            || hit == HIT_RANGE_XMAX
+            || hit == HIT_RANGE_YMIN
+            || hit == HIT_RANGE_YMAX
+        {
             CursorIcon::Text
         } else {
             CursorIcon::Default
@@ -204,9 +227,25 @@ impl PlotypusApp {
         let any_cmd_mod =
             self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
 
-        if !any_cmd_mod && self.text_state.focused {
-            if let Some(action) = self.handle_input_text(&event) {
-                return action;
+        if !any_cmd_mod {
+            match self.focused_box {
+                FocusedBox::Formula => {
+                    if let Some(action) = self.handle_input_text(&event) {
+                        return action;
+                    }
+                }
+                FocusedBox::Base => {
+                    if let Some(action) = self.handle_base_input(&event) {
+                        return action;
+                    }
+                }
+                FocusedBox::RangeXMin | FocusedBox::RangeXMax
+                | FocusedBox::RangeYMin | FocusedBox::RangeYMax => {
+                    if let Some(action) = self.handle_range_input(&event) {
+                        return action;
+                    }
+                }
+                FocusedBox::None => {}
             }
         }
 
@@ -321,16 +360,150 @@ impl PlotypusApp {
         }
     }
 
-    pub fn defocus_textbox(&mut self) {
-        if self.text_state.focused {
-            self.text_state.focused = false;
+    /// Set focus to a specific box, defocusing any previously focused box.
+    pub fn focus_box(&mut self, target: FocusedBox) {
+        if self.focused_box == target {
+            return;
+        }
+        // Commit range box edits when leaving a range box
+        self.commit_range_edit();
+        self.focused_box = target;
+        self.text_state.focused = target == FocusedBox::Formula;
+        self.window_dirty = true;
+    }
+
+    /// Focus a range box and prepare it for editing.
+    pub fn focus_range_box(&mut self, target: FocusedBox) {
+        self.commit_range_edit();
+        self.focused_box = target;
+        self.text_state.focused = false;
+        let idx = self.range_box_index(target).unwrap();
+        self.range_text_states[idx].focused = true;
+        self.range_text_states[idx].blinkey_index = self.range_text_states[idx].chars.len();
+        self.window_dirty = true;
+    }
+
+    /// Defocus all boxes, committing any pending range edits.
+    pub fn defocus_all(&mut self) {
+        self.commit_range_edit();
+        self.focused_box = FocusedBox::None;
+        self.text_state.focused = false;
+        for ts in &mut self.range_text_states {
+            ts.focused = false;
+        }
+        self.window_dirty = true;
+    }
+
+    /// If a range box is focused, parse its text and apply to plot_view.
+    fn commit_range_edit(&mut self) {
+        let idx = match self.focused_box {
+            FocusedBox::RangeXMin => Some(0),
+            FocusedBox::RangeXMax => Some(1),
+            FocusedBox::RangeYMin => Some(2),
+            FocusedBox::RangeYMax => Some(3),
+            _ => None,
+        };
+        if let Some(i) = idx {
+            let text: String = self.range_text_states[i].chars.iter().collect();
+            if let Some(val) = formula::parse_value(&text, self.base) {
+                match i {
+                    0 => self.plot_view.x_min = val,
+                    1 => self.plot_view.x_max = val,
+                    2 => self.plot_view.y_min = val,
+                    3 => self.plot_view.y_max = val,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn range_box_index(&self, fb: FocusedBox) -> Option<usize> {
+        match fb {
+            FocusedBox::RangeXMin => Some(0),
+            FocusedBox::RangeXMax => Some(1),
+            FocusedBox::RangeYMin => Some(2),
+            FocusedBox::RangeYMax => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Handle keyboard input for the base box.
+    fn handle_base_input(&mut self, event: &KeyEvent) -> Option<KeyAction> {
+        if let Key::Named(NamedKey::Escape) = event.logical_key {
+            self.defocus_all();
+            return Some(KeyAction::Redraw);
+        }
+        if let Key::Character(ref c) = event.logical_key {
+            for ch in c.chars() {
+                if let Some(new_base) = formula::char_to_base(ch) {
+                    self.base = new_base;
+                    // Re-parse formula with new base
+                    self.formula = None;
+                    self.window_dirty = true;
+                    return Some(KeyAction::Redraw);
+                }
+            }
+        }
+        Some(KeyAction::None)
+    }
+
+    /// Handle keyboard input for a focused range box.
+    fn handle_range_input(&mut self, event: &KeyEvent) -> Option<KeyAction> {
+        let idx = self.range_box_index(self.focused_box)?;
+        let mut changed = false;
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.defocus_all();
+                return Some(KeyAction::Redraw);
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.commit_range_edit();
+                self.defocus_all();
+                return Some(KeyAction::Redraw);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                changed = self.range_text_states[idx].delete_backward();
+            }
+            Key::Named(NamedKey::Delete) => {
+                changed = self.range_text_states[idx].delete_forward();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                changed = self.range_text_states[idx].move_left();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                changed = self.range_text_states[idx].move_right();
+            }
+            Key::Named(NamedKey::Home) => {
+                changed = self.range_text_states[idx].home();
+            }
+            Key::Named(NamedKey::End) => {
+                changed = self.range_text_states[idx].end();
+            }
+            Key::Character(c) => {
+                let font_size = self.input_font_size();
+                for ch in c.chars() {
+                    if ch.is_control() {
+                        continue;
+                    }
+                    let w = measure_char_width(&mut self.text_renderer, ch, font_size);
+                    self.range_text_states[idx].insert(ch, w);
+                    changed = true;
+                }
+            }
+            _ => return None,
+        }
+        if changed {
             self.window_dirty = true;
+            Some(KeyAction::Redraw)
+        } else {
+            Some(KeyAction::None)
         }
     }
 
     fn input_font_size(&self) -> f32 {
         let btn_h = self.button_height();
-        let (input_rect, _) = PlotypusApp::compute_layout(self.width, self.height, btn_h);
+        let layout = PlotypusApp::compute_layout(self.width, self.height, btn_h);
+        let input_rect = layout.formula_rect;
         (input_rect.h as f32 * 0.55).max(12.0)
     }
 }

@@ -47,6 +47,7 @@ pub fn draw_plot(
     label_font_size: f32,
     formula: Option<&[Token]>,
     parse_failed: bool,
+    base: u8,
 ) {
     fill_rect(
         pixels,
@@ -65,10 +66,10 @@ pub fn draw_plot(
         // Eval errors (stack underflow, etc.) shouldn't fire on a token vector that
         // tokenize() accepted — but if they do, fall back to INFINITY so the column
         // shows as a yellow stripe (visible, not crashy).
-        let curve = |x: S43| formula::evaluate(tokens, x).unwrap_or(S43::INFINITY);
+        let curve = |x: S43| formula::evaluate(tokens, x, base).unwrap_or(S43::INFINITY);
         draw_curve(pixels, window_width, rect, view, curve);
     }
-    draw_axis_labels(pixels, text_renderer, window_width, rect, view, label_font_size);
+    draw_axis_labels(pixels, text_renderer, window_width, rect, view, label_font_size, base);
 }
 
 /// 32×-supersampled area-chart renderer. Each column fills from the curve's pixel-y down to the bottom of the plot rect — no line, no baseline strip, just a filled region whose top edge is the curve.
@@ -294,6 +295,7 @@ fn draw_axis_labels(
     rect: Rect,
     view: PlotView,
     font_size: f32,
+    base: u8,
 ) {
     let x_range = view.x_max - view.x_min;
     let y_range = view.y_max - view.y_min;
@@ -309,22 +311,28 @@ fn draw_axis_labels(
     let plot_lft = rect.x as i32;
     let plot_rgt = (rect.x + rect.w) as i32;
 
-    // x-label baseline anchored to world-y=0 row (or nearest plot edge).
+    // x-label baseline anchored to world-y=0 row (or nearest plot edge). When the axis is on-screen, labels go toward the plot centre: above the axis if it's in the bottom half, below if it's in the top half.
     let zero_py = map_y(view, rect, S43::ZERO);
+    let plot_mid_y = (plot_top + plot_bot) / 2;
     let x_label_baseline = if zero_py < plot_top {
         plot_top as f32 + font_size + 2.0
     } else if zero_py > plot_bot {
         plot_bot as f32 - font_size * 0.5 - 2.0
+    } else if zero_py >= plot_mid_y {
+        zero_py as f32 - font_size * 0.5 - 2.0
     } else {
         zero_py as f32 + font_size + 2.0
     };
 
-    // y-label x position anchored to world-x=0 column (or nearest plot edge). When the axis is past the right edge, right-align into the plot.
+    // y-label x position anchored to world-x=0 column (or nearest plot edge). When the axis is on-screen, labels go toward the plot centre: left of the axis if it's in the right half, right if it's in the left half.
     let zero_px = map_x(view, rect, S43::ZERO);
+    let plot_mid_x = (plot_lft + plot_rgt) / 2;
     let (y_label_x, align_left) = if zero_px < plot_lft {
         (plot_lft as f32 + 4.0, true)
     } else if zero_px > plot_rgt {
         (plot_rgt as f32 - 4.0, false)
+    } else if zero_px >= plot_mid_x {
+        (zero_px as f32 - 4.0, false)
     } else {
         (zero_px as f32 + 4.0, true)
     };
@@ -338,28 +346,28 @@ fn draw_axis_labels(
     // Level 0 (primary), level 1 (primary/2 odd), level 2 (primary/4 odd).
     draw_x_labels_at_level(
         pixels, text_renderer, window_width, rect, view, x_primary, true,
-        x_label_baseline, s0,
+        x_label_baseline, s0, base,
     );
     draw_x_labels_at_level(
         pixels, text_renderer, window_width, rect, view, x_primary >> 1u8, false,
-        x_label_baseline, s1,
+        x_label_baseline, s1, base,
     );
     draw_x_labels_at_level(
         pixels, text_renderer, window_width, rect, view, x_primary >> 2u8, false,
-        x_label_baseline, s2,
+        x_label_baseline, s2, base,
     );
 
     draw_y_labels_at_level(
         pixels, text_renderer, window_width, rect, view, y_primary, true,
-        y_label_x, align_left, s0,
+        y_label_x, align_left, s0, base,
     );
     draw_y_labels_at_level(
         pixels, text_renderer, window_width, rect, view, y_primary >> 1u8, false,
-        y_label_x, align_left, s1,
+        y_label_x, align_left, s1, base,
     );
     draw_y_labels_at_level(
         pixels, text_renderer, window_width, rect, view, y_primary >> 2u8, false,
-        y_label_x, align_left, s2,
+        y_label_x, align_left, s2, base,
     );
 }
 
@@ -373,6 +381,7 @@ fn draw_x_labels_at_level(
     level_zero: bool,
     baseline_y: f32,
     font_size: f32,
+    base: u8,
 ) {
     let plot_lft = rect.x as i32;
     let plot_rgt = (rect.x + rect.w) as i32;
@@ -386,7 +395,7 @@ fn draw_x_labels_at_level(
         if px <= plot_lft + 4 || px >= plot_rgt - 4 {
             continue;
         }
-        let label = format!("{:4.12}", v);
+        let label = format!("{:4.base$}", v, base = base as usize);
         text_renderer.draw_text_center_u32(
             pixels,
             window_width,
@@ -412,6 +421,7 @@ fn draw_y_labels_at_level(
     label_x: f32,
     align_left: bool,
     font_size: f32,
+    base: u8,
 ) {
     let plot_top = rect.y as i32;
     let plot_bot = (rect.y + rect.h) as i32;
@@ -425,7 +435,7 @@ fn draw_y_labels_at_level(
         if py <= plot_top + (font_size as i32) || py >= plot_bot - 4 {
             continue;
         }
-        let label = format!("{:4.12}", v);
+        let label = format!("{:4.base$}", v, base = base as usize);
         let baseline_y = py as f32 - 2.0;
         if align_left {
             text_renderer.draw_text_left_u32(

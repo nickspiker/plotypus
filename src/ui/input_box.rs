@@ -290,6 +290,56 @@ pub fn render_blinkey(
     }
 }
 
+/// Draw chrome for a simple value box (no prompt). Used by base and range boxes.
+pub fn draw_value_chrome(
+    pixels: &mut [u32],
+    hit_test_map: &mut [u8],
+    mask: &mut [u8],
+    window_width: usize,
+    rect: Rect,
+    focused: bool,
+    hit_id: u8,
+) {
+    for y in rect.y..rect.y + rect.h {
+        let row = y * window_width;
+        for x in rect.x..rect.x + rect.w {
+            pixels[row + x] = theme::TEXTBOX_FILL;
+            hit_test_map[row + x] = hit_id;
+            mask[row + x] = 255;
+        }
+    }
+    let (light, shadow) = if focused {
+        (0xFF_8A_82_6B, theme::TEXTBOX_SHADOW_EDGE)
+    } else {
+        (theme::TEXTBOX_LIGHT_EDGE, theme::TEXTBOX_SHADOW_EDGE)
+    };
+    frame(pixels, window_width, rect, light, shadow);
+}
+
+/// Render a centered string into a value box.
+pub fn render_value_text(
+    pixels: &mut [u32],
+    text_renderer: &mut TextRenderer,
+    window_width: usize,
+    text: &str,
+    rect: Rect,
+    font_size: f32,
+) {
+    let baseline_y = rect.y as f32 + rect.h as f32 / 2.0;
+    let center_x = rect.x as f32 + rect.w as f32 / 2.0;
+    text_renderer.draw_text_center_u32(
+        pixels,
+        window_width,
+        text,
+        center_x,
+        baseline_y,
+        font_size,
+        400,
+        theme::TEXT_COLOUR,
+        theme::FONT_USER_CONTENT,
+    );
+}
+
 fn fill(pixels: &mut [u32], hit: &mut [u8], mask: &mut [u8], width: usize, r: Rect, colour: u32) {
     for y in r.y..r.y + r.h {
         let row = y * width;

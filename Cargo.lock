@@ -2757,7 +2757,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.3.5"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0946a7d646a92bac873ec63b8de27b9e004f2386937e01cc4b8ca455c3a4d45"
 dependencies = [
  "bitvec",
  "blake3",

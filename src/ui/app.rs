@@ -1,7 +1,11 @@
 use crate::formula::{self, ParseError, Token};
-use crate::ui::compositing::{HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON};
+use crate::ui::compositing::{
+    HIT_BASE_BOX, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
+    HIT_RANGE_XMIN, HIT_RANGE_XMAX, HIT_RANGE_YMIN, HIT_RANGE_YMAX,
+};
 use crate::ui::input_box::{
-    self, InputLayout, TextState, draw_chrome, recompute_widths, render_blinkey, render_text,
+    self, InputLayout, TextState, draw_chrome, draw_value_chrome, recompute_widths,
+    render_blinkey, render_text, render_value_text,
 };
 use crate::ui::plot::{PlotView, Rect, draw_plot, screen_to_world};
 use crate::ui::renderer::Renderer;
@@ -23,6 +27,17 @@ pub enum HoveredButton {
     Maximize,
     Minimize,
     Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedBox {
+    None,
+    Formula,
+    Base,
+    RangeXMin,
+    RangeXMax,
+    RangeYMin,
+    RangeYMax,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +132,20 @@ pub struct PlotypusApp {
     pub plot_drag: Option<PlotDrag>,
     /// Last successful parse of `text_state.chars`. `None` until the first parse runs (in `render`); `Some(Err(...))` means the user's input doesn't parse, in which case no curve is drawn.
     pub formula: Option<Result<Vec<Token>, ParseError>>,
+
+    // Base
+    pub base: u8,
+
+    // Range input boxes (x_min, x_max, y_min, y_max)
+    pub range_text_states: [TextState; 4],
+    pub focused_box: FocusedBox,
+}
+
+pub struct Layout {
+    pub formula_rect: Rect,
+    pub base_rect: Rect,
+    pub range_rects: [Rect; 4], // x_min, x_max, y_min, y_max
+    pub plot_rect: Rect,
 }
 
 fn compute_span(width: u32, height: u32) -> f32 {
@@ -176,12 +205,21 @@ impl PlotypusApp {
             plot_view: PlotView::default(),
             plot_drag: None,
             formula: None,
+            base: formula::DEFAULT_BASE,
+            range_text_states: [
+                TextState::new(),
+                TextState::new(),
+                TextState::new(),
+                TextState::new(),
+            ],
+            focused_box: FocusedBox::Formula,
         }
     }
 
     /// Begin a pan or zoom drag anchored at the given screen position. Returns false if the position is outside the plot rect (caller should not start).
     pub fn start_plot_drag(&mut self, mode: PlotDragMode, x: f32, y: f32) -> bool {
-        let (_, plot_rect) = Self::compute_layout(self.width, self.height, self.button_height());
+        let layout = Self::compute_layout(self.width, self.height, self.button_height());
+        let plot_rect = layout.plot_rect;
         if !point_in_rect(plot_rect, x, y) {
             return false;
         }
@@ -202,7 +240,8 @@ impl PlotypusApp {
     /// Apply the cursor's current position to the active drag. Returns true if the view changed and a redraw is needed.
     pub fn update_plot_drag(&mut self, x: f32, y: f32) -> bool {
         let btn_h = self.button_height();
-        let (_, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
+        let layout = Self::compute_layout(self.width, self.height, btn_h);
+        let plot_rect = layout.plot_rect;
         let Some(drag) = self.plot_drag.as_mut() else {
             return false;
         };
@@ -249,37 +288,55 @@ impl PlotypusApp {
         (self.span / 32.0 * self.ru).ceil() as usize
     }
 
-    /// Compute the input-box and plot rectangles from window dims and chrome bar height. Layout: chrome row at the top (where the window controls live), then a margin, then a one-line input row, then the plot fills the rest down to the bottom margin.
-    pub fn compute_layout(width: u32, height: u32, button_height: usize) -> (Rect, Rect) {
+    /// Compute all UI rectangles from window dims and chrome bar height.
+    /// Layout top-to-bottom:
+    ///   Row 1: [formula | base]
+    ///   Row 2: [y_max] (centered, matches plot width)
+    ///   Row 3: [x_min | x_max] (left/right, flanking plot)
+    ///   Row 4: [y_min] (centered, matches plot width)
+    ///   Then: plot fills the rest.
+    pub fn compute_layout(width: u32, height: u32, button_height: usize) -> Layout {
         let w = width as usize;
         let h = height as usize;
         let margin = button_height;
         let gap = (button_height / 4).max(2);
         let input_h = button_height;
 
-        let input_x = margin;
-        let input_y = button_height + gap;
-        let input_w = w.saturating_sub(margin * 2);
+        // Row 1: formula + base
+        let row1_y = button_height + gap;
+        let total_w = w.saturating_sub(margin * 2);
+        let base_w = input_h * 2;
+        let formula_w = total_w.saturating_sub(gap + base_w);
 
-        let plot_x = margin;
-        let plot_y = input_y + input_h + gap;
-        let plot_w = w.saturating_sub(margin * 2);
+        // Row 2: y_max (full width)
+        let row2_y = row1_y + input_h + gap;
+
+        // Row 3: x_min (left half) | x_max (right half)
+        let row3_y = row2_y + input_h + gap;
+        let half_w = total_w.saturating_sub(gap) / 2;
+
+        // Row 4: y_min (full width)
+        let row4_y = row3_y + input_h + gap;
+
+        // Plot
+        let plot_y = row4_y + input_h + gap;
         let plot_h = h.saturating_sub(plot_y + margin);
 
-        (
-            Rect {
-                x: input_x,
-                y: input_y,
-                w: input_w,
-                h: input_h,
-            },
-            Rect {
-                x: plot_x,
-                y: plot_y,
-                w: plot_w,
-                h: plot_h,
-            },
-        )
+        Layout {
+            formula_rect: Rect { x: margin, y: row1_y, w: formula_w, h: input_h },
+            base_rect: Rect { x: margin + formula_w + gap, y: row1_y, w: base_w, h: input_h },
+            range_rects: [
+                // 0: x_min — row 3 left
+                Rect { x: margin, y: row3_y, w: half_w, h: input_h },
+                // 1: x_max — row 3 right
+                Rect { x: margin + half_w + gap, y: row3_y, w: half_w, h: input_h },
+                // 2: y_min — row 4 full width
+                Rect { x: margin, y: row4_y, w: total_w, h: input_h },
+                // 3: y_max — row 2 full width
+                Rect { x: margin, y: row2_y, w: total_w, h: input_h },
+            ],
+            plot_rect: Rect { x: margin, y: plot_y, w: total_w, h: plot_h },
+        }
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -388,7 +445,7 @@ impl PlotypusApp {
             self.formula = if text.trim().is_empty() {
                 None
             } else {
-                Some(formula::parse(&text))
+                Some(formula::parse(&text, self.base))
             };
             self.window_dirty = true;
         }
@@ -449,7 +506,9 @@ impl PlotypusApp {
         Self::apply_window_control_hover(pixels, &self.hit_test_map, hover_id, hover_delta);
         let _ = btn_x;
 
-        let (input_rect, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
+        let layout = Self::compute_layout(self.width, self.height, btn_h);
+        let input_rect = layout.formula_rect;
+        let plot_rect = layout.plot_rect;
         if plot_rect.w > 4 && plot_rect.h > 4 {
             let label_font_size = (btn_h as f32 * 0.5).max(10.0);
             let formula = self
@@ -469,14 +528,18 @@ impl PlotypusApp {
                 label_font_size,
                 formula,
                 parse_failed,
+                self.base,
             );
         }
+
+        // Sync focused state from focused_box enum
+        self.text_state.focused = self.focused_box == FocusedBox::Formula;
 
         // Input box: draw chrome (bg + frame + prompt), then additively render text and blinkey. Snapshot text_state + layout + blinkey position so the diff path can subtract them on the next text-only update.
         if input_rect.w > 4 && input_rect.h > 4 {
             let font_size = (input_rect.h as f32 * 0.55).max(12.0);
             let prompt_w = input_box::measure_prompt_width(&mut self.text_renderer, font_size);
-            let layout = InputLayout::new(input_rect, prompt_w, font_size);
+            let input_layout = InputLayout::new(input_rect, prompt_w, font_size);
 
             // Re-measure widths in case the font size changed (resize, ru change).
             recompute_widths(&mut self.text_state, &mut self.text_renderer, font_size);
@@ -488,7 +551,7 @@ impl PlotypusApp {
                 width,
                 input_rect,
                 self.text_state.focused,
-                &layout,
+                &input_layout,
                 &mut self.text_renderer,
             );
 
@@ -497,7 +560,7 @@ impl PlotypusApp {
                 &mut self.text_renderer,
                 width,
                 &self.text_state,
-                &layout,
+                &input_layout,
                 &self.textbox_mask,
                 true,
             );
@@ -505,26 +568,88 @@ impl PlotypusApp {
             let blinkey_visible = self.text_state.focused;
             if blinkey_visible {
                 self.blinkey_top_bright = rand::thread_rng().r#gen();
-                let bx = layout.cursor_x(&self.text_state);
+                let bx = input_layout.cursor_x(&self.text_state);
                 render_blinkey(
                     pixels,
                     width,
                     bx,
-                    layout.blinkey_top,
-                    layout.blinkey_height,
+                    input_layout.blinkey_top,
+                    input_layout.blinkey_height,
                     self.blinkey_top_bright,
                     true,
                 );
                 self.last_blinkey_x = bx;
-                self.last_blinkey_top = layout.blinkey_top;
-                self.last_blinkey_height = layout.blinkey_height;
+                self.last_blinkey_top = input_layout.blinkey_top;
+                self.last_blinkey_height = input_layout.blinkey_height;
                 self.next_blink_time = next_blink_wake();
             }
             self.blinkey_visible = blinkey_visible;
 
             self.last_text_state = self.text_state.clone();
-            self.last_layout = Some(layout);
+            self.last_layout = Some(input_layout);
             self.text_dirty = false;
+        }
+
+        // Base box
+        let base_rect = layout.base_rect;
+        if base_rect.w > 2 && base_rect.h > 2 {
+            let base_focused = self.focused_box == FocusedBox::Base;
+            draw_value_chrome(
+                pixels, &mut self.hit_test_map, &mut self.textbox_mask,
+                width, base_rect, base_focused, HIT_BASE_BOX,
+            );
+            let base_font_size = (base_rect.h as f32 * 0.55).max(12.0);
+            let base_ch = formula::base_to_char(self.base);
+            let base_str = format!("{}", base_ch);
+            render_value_text(
+                pixels, &mut self.text_renderer, width,
+                &base_str, base_rect, base_font_size,
+            );
+        }
+
+        // Range boxes: sync text from plot_view when not focused, then draw
+        let range_hit_ids = [HIT_RANGE_XMIN, HIT_RANGE_XMAX, HIT_RANGE_YMIN, HIT_RANGE_YMAX];
+        let range_focused_variants = [
+            FocusedBox::RangeXMin, FocusedBox::RangeXMax,
+            FocusedBox::RangeYMin, FocusedBox::RangeYMax,
+        ];
+        let range_values = [
+            self.plot_view.x_min, self.plot_view.x_max,
+            self.plot_view.y_min, self.plot_view.y_max,
+        ];
+        let base = self.base;
+        for i in 0..4 {
+            let r = layout.range_rects[i];
+            if r.w < 4 || r.h < 4 { continue; }
+            let focused = self.focused_box == range_focused_variants[i];
+            // When not focused, populate from live plot_view
+            if !focused {
+                let formatted = format!("{:4.base$}", range_values[i], base = base as usize);
+                self.range_text_states[i].chars = formatted.chars().collect();
+                self.range_text_states[i].widths = vec![0; self.range_text_states[i].chars.len()];
+                self.range_text_states[i].blinkey_index = self.range_text_states[i].chars.len();
+            }
+            self.range_text_states[i].focused = focused;
+            draw_value_chrome(
+                pixels, &mut self.hit_test_map, &mut self.textbox_mask,
+                width, r, focused, range_hit_ids[i],
+            );
+            if focused {
+                // Draw editable text with blinkey
+                let font_size = (r.h as f32 * 0.55).max(12.0);
+                let il = InputLayout::new(r, 0.0, font_size);
+                recompute_widths(&mut self.range_text_states[i], &mut self.text_renderer, font_size);
+                render_text(
+                    pixels, &mut self.text_renderer, width,
+                    &self.range_text_states[i], &il, &self.textbox_mask, true,
+                );
+                let bx = il.cursor_x(&self.range_text_states[i]);
+                render_blinkey(pixels, width, bx, il.blinkey_top, il.blinkey_height, true, true);
+            } else {
+                let font_size = (r.h as f32 * 0.45).max(10.0);
+                let text: String = self.range_text_states[i].chars.iter().collect();
+                render_value_text(pixels, &mut self.text_renderer, width, &text, r, font_size);
+            }
         }
 
         if debug {

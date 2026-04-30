@@ -10,6 +10,11 @@ pub const HIT_CLOSE_BUTTON: u8 = 3;
 pub const HIT_BODY: u8 = 4;
 pub const HIT_INPUT_BOX: u8 = 5;
 pub const HIT_PLOT_AREA: u8 = 6;
+pub const HIT_BASE_BOX: u8 = 7;
+pub const HIT_RANGE_XMIN: u8 = 8;
+pub const HIT_RANGE_XMAX: u8 = 9;
+pub const HIT_RANGE_YMIN: u8 = 10;
+pub const HIT_RANGE_YMAX: u8 = 11;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const PREMULTIPLIED: bool = true;
