@@ -1,3 +1,4 @@
+use crate::formula::{self, ParseError, RpnOp};
 use crate::ui::compositing::{HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON};
 use crate::ui::input_box::{
     self, InputLayout, TextState, draw_chrome, recompute_widths, render_blinkey, render_text,
@@ -12,6 +13,8 @@ use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize;
 use winit::keyboard::ModifiersState;
 use winit::window::Window;
+
+const DEFAULT_FORMULA: &str = "#sin(x*@pi*2)*0.7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoveredButton {
@@ -112,6 +115,8 @@ pub struct PlotypusApp {
     // Plot
     pub plot_view: PlotView,
     pub plot_drag: Option<PlotDrag>,
+    /// Last successful parse of `text_state.chars`. `None` until the first parse runs (in `render`); `Some(Err(...))` means the user's input doesn't parse, in which case no curve is drawn.
+    pub formula: Option<Result<Vec<RpnOp>, ParseError>>,
 }
 
 fn compute_span(width: u32, height: u32) -> f32 {
@@ -152,6 +157,10 @@ impl PlotypusApp {
             text_state: {
                 let mut t = TextState::new();
                 t.focused = true;
+                t.chars = DEFAULT_FORMULA.chars().collect();
+                // Widths are filled in by `recompute_widths` on the first render — do that work once we know the actual font size.
+                t.widths = vec![0; t.chars.len()];
+                t.blinkey_index = t.chars.len();
                 t
             },
             last_text_state: TextState::new(),
@@ -166,6 +175,7 @@ impl PlotypusApp {
             next_blink_time: Instant::now() + Duration::from_millis(300),
             plot_view: PlotView::default(),
             plot_drag: None,
+            formula: None,
         }
     }
 
@@ -371,6 +381,13 @@ impl PlotypusApp {
     pub fn render(&mut self) {
         self.frame_counter += 1;
 
+        // Re-parse the formula whenever the input text has changed (or on the very first render). The curve closure passed to `draw_plot` reads from `self.formula`, so the parse must happen before we hit the redraw paths. A new parse forces a full redraw — the differential text path doesn't redraw the plot, but the curve depends on the formula.
+        if self.text_dirty || self.formula.is_none() {
+            let text: String = self.text_state.chars.iter().collect();
+            self.formula = Some(formula::parse(&text));
+            self.window_dirty = true;
+        }
+
         if !self.needs_full_redraw() {
             if self.text_dirty {
                 self.render_input_diff();
@@ -430,6 +447,11 @@ impl PlotypusApp {
         let (input_rect, plot_rect) = Self::compute_layout(self.width, self.height, btn_h);
         if plot_rect.w > 4 && plot_rect.h > 4 {
             let label_font_size = (btn_h as f32 * 0.5).max(10.0);
+            let formula = self
+                .formula
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(|v| v.as_slice());
             draw_plot(
                 pixels,
                 &mut self.hit_test_map,
@@ -438,6 +460,7 @@ impl PlotypusApp {
                 plot_rect,
                 self.plot_view,
                 label_font_size,
+                formula,
             );
         }
 

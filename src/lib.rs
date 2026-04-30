@@ -1,3 +1,4 @@
+pub mod formula;
 pub mod ui;
 
 #[cfg(feature = "logging")]

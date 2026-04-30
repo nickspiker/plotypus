@@ -1,4 +1,5 @@
 //! Plot region: axes, grid, and curve. View bounds are kept in `PlotView` so pan/zoom can mutate them without touching the rendering code.
+use crate::formula::{self, RpnOp};
 use crate::ui::compositing::HIT_PLOT_AREA;
 use crate::ui::text_rasterizing::TextRenderer;
 use crate::ui::theme;
@@ -44,6 +45,7 @@ pub fn draw_plot(
     rect: Rect,
     view: PlotView,
     label_font_size: f32,
+    formula: Option<&[RpnOp]>,
 ) {
     fill_rect(
         pixels,
@@ -54,14 +56,11 @@ pub fn draw_plot(
         HIT_PLOT_AREA,
     );
     draw_dyadic_grid(pixels, window_width, rect, view);
-    draw_test_curve(pixels, window_width, rect, view);
+    if let Some(rpn) = formula {
+        let curve = |x: S43| formula::evaluate(rpn, x);
+        draw_curve(pixels, window_width, rect, view, curve);
+    }
     draw_axis_labels(pixels, text_renderer, window_width, rect, view, label_font_size);
-}
-
-/// Hardcoded `y = sin(x · 2π) · 0.7` until the evaluator lands. The closure is the seam where a Spirix-evaluated `y = f(x)` will plug in.
-fn draw_test_curve(pixels: &mut [u32], window_width: usize, rect: Rect, view: PlotView) {
-    let curve = |x: S43| (x * S43::TAU).sin() * 0.7;
-    draw_curve(pixels, window_width, rect, view, curve);
 }
 
 /// 32×-supersampled area-chart renderer. Each column fills from the curve's pixel-y down to the bottom of the plot rect — no line, no baseline strip, just a filled region whose top edge is the curve.
