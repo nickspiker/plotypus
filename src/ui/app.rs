@@ -1,4 +1,4 @@
-use crate::formula::{self, ParseError, RpnOp};
+use crate::formula::{self, ParseError, Token};
 use crate::ui::compositing::{HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON};
 use crate::ui::input_box::{
     self, InputLayout, TextState, draw_chrome, recompute_widths, render_blinkey, render_text,
@@ -116,7 +116,7 @@ pub struct PlotypusApp {
     pub plot_view: PlotView,
     pub plot_drag: Option<PlotDrag>,
     /// Last successful parse of `text_state.chars`. `None` until the first parse runs (in `render`); `Some(Err(...))` means the user's input doesn't parse, in which case no curve is drawn.
-    pub formula: Option<Result<Vec<RpnOp>, ParseError>>,
+    pub formula: Option<Result<Vec<Token>, ParseError>>,
 }
 
 fn compute_span(width: u32, height: u32) -> f32 {
@@ -384,7 +384,12 @@ impl PlotypusApp {
         // Re-parse the formula whenever the input text has changed (or on the very first render). The curve closure passed to `draw_plot` reads from `self.formula`, so the parse must happen before we hit the redraw paths. A new parse forces a full redraw — the differential text path doesn't redraw the plot, but the curve depends on the formula.
         if self.text_dirty || self.formula.is_none() {
             let text: String = self.text_state.chars.iter().collect();
-            self.formula = Some(formula::parse(&text));
+            // Empty box = resting state (formula = None); only call parser on non-empty input so empty box keeps grid + labels visible.
+            self.formula = if text.trim().is_empty() {
+                None
+            } else {
+                Some(formula::parse(&text))
+            };
             self.window_dirty = true;
         }
 
@@ -452,6 +457,8 @@ impl PlotypusApp {
                 .as_ref()
                 .and_then(|r| r.as_ref().ok())
                 .map(|v| v.as_slice());
+            // Empty input is filtered upstream (formula stays `None`), so any `Some(Err(_))` here is a real parse error and we blank the plot region as a visual "your formula is broken" signal.
+            let parse_failed = matches!(&self.formula, Some(Err(_)));
             draw_plot(
                 pixels,
                 &mut self.hit_test_map,
@@ -461,6 +468,7 @@ impl PlotypusApp {
                 self.plot_view,
                 label_font_size,
                 formula,
+                parse_failed,
             );
         }
 

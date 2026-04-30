@@ -1,5 +1,5 @@
 //! Plot region: axes, grid, and curve. View bounds are kept in `PlotView` so pan/zoom can mutate them without touching the rendering code.
-use crate::formula::{self, RpnOp};
+use crate::formula::{self, Token};
 use crate::ui::compositing::HIT_PLOT_AREA;
 use crate::ui::text_rasterizing::TextRenderer;
 use crate::ui::theme;
@@ -45,7 +45,8 @@ pub fn draw_plot(
     rect: Rect,
     view: PlotView,
     label_font_size: f32,
-    formula: Option<&[RpnOp]>,
+    formula: Option<&[Token]>,
+    parse_failed: bool,
 ) {
     fill_rect(
         pixels,
@@ -55,9 +56,16 @@ pub fn draw_plot(
         0xFF_00_00_00,
         HIT_PLOT_AREA,
     );
+    // Parse error → blank black plot region. Skipping grid + labels + curve makes "your formula didn't parse" obvious at a glance, distinct from a valid expression that happens to evaluate offscreen.
+    if parse_failed {
+        return;
+    }
     draw_dyadic_grid(pixels, window_width, rect, view);
-    if let Some(rpn) = formula {
-        let curve = |x: S43| formula::evaluate(rpn, x);
+    if let Some(tokens) = formula {
+        // Eval errors (stack underflow, etc.) shouldn't fire on a token vector that
+        // tokenize() accepted — but if they do, fall back to INFINITY so the column
+        // shows as a yellow stripe (visible, not crashy).
+        let curve = |x: S43| formula::evaluate(tokens, x).unwrap_or(S43::INFINITY);
         draw_curve(pixels, window_width, rect, view, curve);
     }
     draw_axis_labels(pixels, text_renderer, window_width, rect, view, label_font_size);
@@ -378,7 +386,7 @@ fn draw_x_labels_at_level(
         if px <= plot_lft + 4 || px >= plot_rgt - 4 {
             continue;
         }
-        let label = format!("{:4.10}", v);
+        let label = format!("{:4.12}", v);
         text_renderer.draw_text_center_u32(
             pixels,
             window_width,
@@ -417,7 +425,7 @@ fn draw_y_labels_at_level(
         if py <= plot_top + (font_size as i32) || py >= plot_bot - 4 {
             continue;
         }
-        let label = format!("{:4.10}", v);
+        let label = format!("{:4.12}", v);
         let baseline_y = py as f32 - 2.0;
         if align_left {
             text_renderer.draw_text_left_u32(
