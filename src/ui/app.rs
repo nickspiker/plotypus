@@ -290,6 +290,18 @@ impl PlotypusApp {
         plot::screen_to_world(self.plot_rect, self.plot_view, sx, sy)
     }
 
+    /// Show the world coords under a plot click in the chrome status line, formatted in the
+    /// current base (Spirix Display takes the format precision as the output radix, like
+    /// the axis labels). Requests a redraw so the readout updates immediately.
+    fn show_click_coords(&mut self, sx: Coord, sy: Coord, ctx: &mut Context) {
+        let (wx, wy) = self.plot_screen_to_world(sx, sy);
+        let b = self.base as usize;
+        let text = format!("x {:6.b$}   y {:6.b$}", wx, wy, b = b);
+        if self.chrome.set_status_text(Some(text)) {
+            ctx.window.request_redraw();
+        }
+    }
+
     fn start_plot_drag(&mut self, mode: PlotDragMode, x: Coord, y: Coord) {
         let (anchor_world_x, anchor_world_y) = self.plot_screen_to_world(x, y);
         self.plot_drag = Some(PlotDrag {
@@ -587,6 +599,7 @@ impl FluorApp for PlotypusApp {
                 // Plot: plain drag = pan, zoom-modifier drag = zoom.
                 if self.point_in_plot(x, y) {
                     self.change_focus(None, ctx);
+                    self.show_click_coords(x, y, ctx);
                     let mode = if self.modifiers.control_key() || self.modifiers.super_key() {
                         PlotDragMode::Zoom
                     } else {
@@ -618,6 +631,7 @@ impl FluorApp for PlotypusApp {
                 let x = ctx.cursor_x;
                 let y = ctx.cursor_y;
                 if self.point_in_plot(x, y) {
+                    self.show_click_coords(x, y, ctx);
                     self.start_plot_drag(PlotDragMode::Aspect, x, y);
                     return EventResponse::Handled;
                 }
