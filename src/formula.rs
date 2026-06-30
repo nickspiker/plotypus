@@ -16,11 +16,17 @@
 
 use spirix::ScalarF4E3 as S43;
 
-/// Numeric base used for tokenizing numeric literals AND for rendering axis labels.
-pub const BASE: u8 = 12;
+/// Default numeric base (dozenal — basecalc heritage). Overridden at runtime by the base
+/// input box. The base is purely an input/label concern: it controls how a literal like
+/// `2000` is converted into an S43 value (and how axis labels are rendered, since Spirix's
+/// Display takes the base as the format precision). All Spirix math downstream is
+/// base-agnostic.
+pub const DEFAULT_BASE: u8 = 12;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 enum Precedence {
+    // Lowest — bitwise `& | ~` bind looser than `+ -` (variant order defines the ordering).
+    Logic,
     Addition,
     Multiplication,
     Exponentiation,
@@ -61,6 +67,11 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
     ("^", '^', 2, "exponentiation"),
     ("%", '%', 2, "modulus"),
     ("$", '$', 2, "logarithm (number$base = log base of number)"),
+    // Bitwise logic — Spirix's two's-complement ops aligned at the binary point. Lowest
+    // precedence (looser than + -), like C. `^` is taken by exponentiation, so xor is `~`.
+    ("&", '&', 2, "bitwise and"),
+    ("|", '|', 2, "bitwise or"),
+    ("~", '~', 2, "bitwise xor"),
     // Parentheses
     ("(", '(', 1, "left parenthesis"),
     (")", ')', 1, "right parenthesis"),
@@ -79,7 +90,6 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
     ("#ceil", 'c', 1, "gaussian ceiling"),
     ("#floor", 'f', 1, "gaussian floor"),
     ("#round", 'r', 1, "gaussian rounding"),
-    ("#int", 'I', 1, "integer part"),
     ("#frac", 'F', 1, "fractional part"),
     ("#sign", 'g', 1, "sign"),
 ];
@@ -111,7 +121,7 @@ impl ParseError {
 // tokenize — basecalc/src/main.rs:1466-1629, minus state-config branches
 // ============================================================================
 
-pub fn tokenize(input_str: &str) -> Result<Vec<Token>, ParseError> {
+pub fn tokenize(input_str: &str, base: u8) -> Result<Vec<Token>, ParseError> {
     let input = input_str.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut index = 0;
@@ -164,7 +174,7 @@ pub fn tokenize(input_str: &str) -> Result<Vec<Token>, ParseError> {
                 follows_number = true;
                 continue;
             }
-            match parse_number(input, BASE, index) {
+            match parse_number(input, base, index) {
                 Ok((token, new_index)) => {
                     tokens.push(token);
                     index = new_index;
@@ -224,14 +234,14 @@ pub fn tokenize(input_str: &str) -> Result<Vec<Token>, ParseError> {
 // evaluate_tokens — basecalc:1642-1796, minus the assignment branch
 // ============================================================================
 
-pub fn evaluate(tokens: &[Token], x: S43) -> Result<S43, String> {
+pub fn evaluate(tokens: &[Token], x: S43, base: u8) -> Result<S43, String> {
     let mut output_queue: Vec<S43> = Vec::new();
     let mut operator_stack: Vec<char> = Vec::new();
 
     for token in tokens {
         match token.operands {
             0 => {
-                let mut value = token2num(token, x);
+                let mut value = token2num(token, x, base);
                 while let Some(&op) = operator_stack.last() {
                     if get_precedence(op) == Precedence::Unary {
                         let operator = operator_stack.pop().unwrap();
@@ -294,8 +304,10 @@ pub fn evaluate(tokens: &[Token], x: S43) -> Result<S43, String> {
 
 fn apply_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
     match op {
-        '+' | '-' | '*' | '/' | '^' | '%' | '$' => apply_binary_operator(output_queue, op)?,
-        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'I' | 'l' | 'r' | 'g' | 's' | 'q'
+        '+' | '-' | '*' | '/' | '^' | '%' | '$' | '&' | '|' | '~' => {
+            apply_binary_operator(output_queue, op)?
+        }
+        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
         | 't' => {
             if let Some(value) = output_queue.pop() {
                 let result = apply_unary_operator(op, value)?;
@@ -311,10 +323,11 @@ fn apply_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
 
 fn get_precedence(op: char) -> Precedence {
     match op {
+        '&' | '|' | '~' => Precedence::Logic,
         '+' | '-' => Precedence::Addition,
         '*' | '/' | '%' => Precedence::Multiplication,
         '^' | '$' => Precedence::Exponentiation,
-        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'I' | 'l' | 'r' | 'g' | 's' | 'q'
+        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
         | 't' => Precedence::Unary,
         '(' | ')' => Precedence::Parenthesis,
         _ => Precedence::Addition,
@@ -327,7 +340,7 @@ fn get_precedence(op: char) -> Precedence {
 
 fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
     let result = match op {
-        'n' => S43::ZERO - value,
+        'n' => -value,
         'a' => value.magnitude(),
         'S' => value.asin(),
         'O' => value.acos(),
@@ -335,9 +348,6 @@ fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
         'c' => value.ceil(),
         'f' => value.floor(),
         'F' => value.frac(),
-        // basecalc's #int is `gaussian_floor` (line 2021); for real-only S43 it's just floor.
-        // Note: this differs from common "trunc toward zero" — kept as basecalc has it.
-        'I' => value.floor(),
         'l' => value.ln(),
         'r' => value.round(),
         'g' => value.sign(),
@@ -364,6 +374,10 @@ fn apply_binary_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), St
             '+' => a + b,
             '-' => a - b,
             '/' => a / b,
+            // Spirix two's-complement bitwise, aligned at the binary point.
+            '&' => a & b,
+            '|' => a | b,
+            '~' => a ^ b,
             _ => return Err(format!("Unknown binary operator: {}", op)),
         };
         output_queue.push(result);
@@ -516,7 +530,7 @@ fn parse_operator(input: &[u8], mut index: usize) -> (Token, usize) {
 // Spirix; numeric literals accumulate digits in base BASE)
 // ============================================================================
 
-fn token2num(token: &Token, x: S43) -> S43 {
+fn token2num(token: &Token, x: S43, base: u8) -> S43 {
     match token.operator {
         // Built-in constants (chars match basecalc's CONSTANTS table)
         'E' => S43::E,
@@ -526,9 +540,9 @@ fn token2num(token: &Token, x: S43) -> S43 {
         'P' => S43::PHI,
         'X' => x,
 
-        // Regular numeric literal — accumulate base-BASE digits.
+        // Regular numeric literal — accumulate base digits.
         _ => {
-            let base_s = S43::from(BASE as u32);
+            let base_s = S43::from(base as u32);
             let mut real_int = S43::ZERO;
             for &digit in &token.real_integer {
                 real_int = real_int * base_s;
@@ -552,8 +566,81 @@ fn token2num(token: &Token, x: S43) -> S43 {
 // Public entry: parse + evaluate in one shot
 // ============================================================================
 
-/// Parse the formula text, returning the token vector for caching. The same vector is
-/// then fed to `evaluate(&tokens, x)` per pixel-x.
-pub fn parse(text: &str) -> Result<Vec<Token>, ParseError> {
-    tokenize(text)
+/// Parse the formula text in `base`, returning the token vector for caching. The same
+/// vector is then fed to `evaluate(&tokens, x, base)` per pixel-x.
+pub fn parse(text: &str, base: u8) -> Result<Vec<Token>, ParseError> {
+    tokenize(text, base)
+}
+
+/// Parse a plain numeric string (e.g. "-1.5") in `base` to S43. Used by the range/bound
+/// input boxes (not the formula box, which goes through `parse`). Returns `None` on any
+/// invalid character for the base.
+pub fn parse_value(text: &str, base: u8) -> Option<S43> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (negative, rest) = if let Some(t) = text.strip_prefix('-') {
+        (true, t)
+    } else if let Some(t) = text.strip_prefix('+') {
+        (false, t)
+    } else {
+        (false, text)
+    };
+    let base_s = S43::from(base as u32);
+    let mut parts = rest.splitn(2, '.');
+
+    let int_str = parts.next().unwrap_or("");
+    let mut int_part = S43::ZERO;
+    for ch in int_str.chars() {
+        let digit = char_to_digit(ch, base)?;
+        int_part = int_part * base_s + S43::from(digit as u32);
+    }
+
+    let mut frac_part = S43::ZERO;
+    if let Some(frac_str) = parts.next() {
+        for ch in frac_str.chars().rev() {
+            let digit = char_to_digit(ch, base)?;
+            frac_part = frac_part + S43::from(digit as u32);
+            frac_part = frac_part / base_s;
+        }
+    }
+
+    let mut result = int_part + frac_part;
+    if negative {
+        result = S43::ZERO - result;
+    }
+    Some(result)
+}
+
+/// Map a digit character to its value, or `None` if it's out of range for `base`.
+fn char_to_digit(ch: char, base: u8) -> Option<u8> {
+    let digit = match ch {
+        '0'..='9' => ch as u8 - b'0',
+        'a'..='z' => ch as u8 - b'a' + 10,
+        'A'..='Z' => ch as u8 - b'A' + 10,
+        _ => return None,
+    };
+    if digit < base { Some(digit) } else { None }
+}
+
+/// Single-character label for a base value (2..=36): `2`..`9`, then `a`..`z`. So dozenal
+/// (12) shows as `c`. Used by the base input box's display.
+pub fn base_to_char(base: u8) -> char {
+    if base <= 9 {
+        (b'0' + base) as char
+    } else {
+        (b'a' + base - 10) as char
+    }
+}
+
+/// Parse a single character into a base value (2..=36). Inverse of [`base_to_char`].
+pub fn char_to_base(ch: char) -> Option<u8> {
+    let base = match ch {
+        '2'..='9' => ch as u8 - b'0',
+        'a'..='z' => ch as u8 - b'a' + 10,
+        'A'..='Z' => ch as u8 - b'A' + 10,
+        _ => return None,
+    };
+    if base >= 2 { Some(base) } else { None }
 }

@@ -63,6 +63,11 @@ pub struct PlotypusApp {
     chrome: DefaultChrome,
     /// Formula input. Its `chars` are the source of truth for the plotted expression.
     formula_box: Textbox,
+    /// Numeric base for parsing literals AND rendering axis labels (2..=36). Type a single
+    /// digit/letter into `base_box` to change it; `c` = dozenal (12), the default.
+    base: u8,
+    /// Base selector — a one-char box showing `formula::base_to_char(self.base)`.
+    base_box: Textbox,
     /// Duration input (seconds) — how long the play sweep takes to cross the viewed
     /// x-range. Parsed as a plain decimal; falls back to `DEFAULT_DURATION` if invalid.
     duration_box: Textbox,
@@ -165,6 +170,13 @@ impl PlotypusApp {
         }
         formula_box.cursor = formula_box.chars.len();
 
+        // Base selector: one char (`c` = dozenal). Typing a digit/letter sets the base.
+        let base = formula::DEFAULT_BASE;
+        let mut base_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        base_box.stroke_ru = 1.0 / 12.0;
+        base_box.chars.push(formula::base_to_char(base));
+        base_box.cursor = base_box.chars.len();
+
         // Duration box: how many seconds the play sweep takes to cross the viewed x-range.
         let mut duration_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
         duration_box.stroke_ru = 1.0 / 12.0;
@@ -181,6 +193,8 @@ impl PlotypusApp {
             title: "Plotypus".to_string(),
             chrome,
             formula_box,
+            base,
+            base_box,
             duration_box,
             play_button,
             hit_counter,
@@ -216,20 +230,24 @@ impl PlotypusApp {
         let chrome_bar = bw * 2.0;
         let row_cy = chrome_bar + gap + row_h * 0.5;
 
-        // Row layout, left→right: formula (flexible) · duration (fixed narrow) · play
-        // button (fixed). The formula box absorbs whatever width the other two leave.
+        // Row layout, left→right: formula (flexible) · base (one char) · duration (narrow)
+        // · play button (fixed). The formula box absorbs whatever width the rest leave.
         let button_w = (bw * 8.0).min(w * 0.25);
         let dur_w = (bw * 5.0).min(w * 0.15);
+        let base_w = bw * 2.5;
         let content_w = w - margin * 2.0;
-        let tb_w = (content_w - dur_w - button_w - gap * 2.0).max(bw * 4.0);
+        let tb_w = (content_w - base_w - dur_w - button_w - gap * 3.0).max(bw * 4.0);
 
         let tb_cx = margin + tb_w * 0.5;
-        let dur_cx = margin + tb_w + gap + dur_w * 0.5;
-        let btn_cx = margin + tb_w + gap + dur_w + gap + button_w * 0.5;
+        let base_cx = margin + tb_w + gap + base_w * 0.5;
+        let dur_cx = margin + tb_w + gap + base_w + gap + dur_w * 0.5;
+        let btn_cx = margin + tb_w + gap + base_w + gap + dur_w + gap + button_w * 0.5;
         let font_size = bw;
 
         self.formula_box.set_rect(tb_cx, row_cy, tb_w, row_h);
         self.formula_box.set_font_size(font_size, ctx.text);
+        self.base_box.set_rect(base_cx, row_cy, base_w, row_h);
+        self.base_box.set_font_size(font_size, ctx.text);
         self.duration_box.set_rect(dur_cx, row_cy, dur_w, row_h);
         self.duration_box.set_font_size(font_size, ctx.text);
         self.play_button.set_rect(btn_cx, row_cy, button_w, row_h);
@@ -251,7 +269,7 @@ impl PlotypusApp {
         self.formula = if text.trim().is_empty() {
             None
         } else {
-            Some(formula::parse(&text))
+            Some(formula::parse(&text, self.base))
         };
         self.notification = None;
     }
@@ -355,9 +373,7 @@ impl PlotypusApp {
         };
         self.notification = Some(voice);
         let samples = voice.render();
-        if let Err(e) = crate::audio::play(samples) {
-            crate::log(&format!("notification playback failed: {e}"));
-        }
+        crate::audio::play(samples);
     }
 
     /// Commit the typed formula: re-parse it (updating the plotted curve) and, if it
@@ -370,6 +386,7 @@ impl PlotypusApp {
             return; // empty box or parse error — nothing to play
         };
         let tokens = tokens.clone();
+        let base = self.base;
         let x_min = self.plot_view.x_min.to_f32();
         let x_max = self.plot_view.x_max.to_f32();
         let y_min = self.plot_view.y_min.to_f32();
@@ -378,16 +395,14 @@ impl PlotypusApp {
         // Map y through the visible y-range to audio full-scale, 1:1 — the vertical axis
         // IS the volume, so a curve that runs off the top/bottom clips and distorts.
         let samples = synth::render_formula(
-            |x: S43| formula::evaluate(&tokens, x).unwrap_or(S43::ZERO),
+            |x: S43| formula::evaluate(&tokens, x, base).unwrap_or(S43::ZERO),
             x_min,
             x_max,
             y_min,
             y_max,
             duration,
         );
-        if let Err(e) = crate::audio::play(samples) {
-            crate::log(&format!("formula playback failed: {e}"));
-        }
+        crate::audio::play(samples);
     }
 
     /// Parse the duration box as plain decimal seconds. Falls back to the default on an
@@ -409,6 +424,8 @@ impl PlotypusApp {
         let focus = self.current_focus?;
         if focus == self.formula_box.hit_id() {
             Some(&mut self.formula_box)
+        } else if focus == self.base_box.hit_id() {
+            Some(&mut self.base_box)
         } else if focus == self.duration_box.hit_id() {
             Some(&mut self.duration_box)
         } else {
@@ -435,6 +452,7 @@ impl PlotypusApp {
 impl Container for PlotypusApp {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         f(&mut self.formula_box);
+        f(&mut self.base_box);
         f(&mut self.duration_box);
         f(&mut self.play_button);
         self.chrome.visit(f);
@@ -507,6 +525,11 @@ impl FluorApp for PlotypusApp {
                 let want_tb = new_hit == self.formula_box.hit_id();
                 if self.formula_box.is_hovered() != want_tb {
                     self.formula_box.set_hovered(want_tb);
+                    changed = true;
+                }
+                let want_base = new_hit == self.base_box.hit_id();
+                if self.base_box.is_hovered() != want_base {
+                    self.base_box.set_hovered(want_base);
                     changed = true;
                 }
                 let want_dur = new_hit == self.duration_box.hit_id();
@@ -695,6 +718,7 @@ impl FluorApp for PlotypusApp {
         // Plot region — straight into the present buffer. Notification mode plots the
         // synth's S43 voice(t); otherwise the parsed formula curve.
         let label_font_size = (ctx.viewport.effective_span() / 64.0).max(10.0);
+        let base = self.base;
         if self.plot_rect.w > 4 && self.plot_rect.h > 4 {
             if let Some(voice) = self.notification {
                 plot::draw_plot_curve(
@@ -706,6 +730,7 @@ impl FluorApp for PlotypusApp {
                     self.plot_rect,
                     self.plot_view,
                     label_font_size,
+                    base,
                     |x: S43| voice.voice(x.to_f32()),
                 );
             } else {
@@ -726,6 +751,7 @@ impl FluorApp for PlotypusApp {
                     label_font_size,
                     formula,
                     parse_failed,
+                    base,
                 );
             }
         }
@@ -743,6 +769,17 @@ impl FluorApp for PlotypusApp {
                 None,
                 Some(&mut self.chrome.hit_test_map),
                 id,
+            );
+            let base_id = self.base_box.hit_id();
+            self.base_box.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                base_id,
             );
             let did = self.duration_box.hit_id();
             self.duration_box.render_content_into(
@@ -773,6 +810,9 @@ impl FluorApp for PlotypusApp {
         if self.current_focus == Some(self.formula_box.hit_id()) {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             self.formula_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
+        } else if self.current_focus == Some(self.base_box.hit_id()) {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            self.base_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
         } else if self.current_focus == Some(self.duration_box.hit_id()) {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             self.duration_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
@@ -808,7 +848,10 @@ impl FluorApp for PlotypusApp {
         if hit == self.play_button.hit_id() {
             return CursorIcon::Pointer;
         }
-        if hit == self.formula_box.hit_id() || hit == self.duration_box.hit_id() {
+        if hit == self.formula_box.hit_id()
+            || hit == self.base_box.hit_id()
+            || hit == self.duration_box.hit_id()
+        {
             return CursorIcon::Text;
         }
         match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
@@ -841,11 +884,12 @@ impl FluorApp for PlotypusApp {
     fn tick(&mut self, _ctx: &mut Context) -> bool {
         let mut needs_redraw = false;
         if self.blink.poll(Instant::now()) {
-            // flip_blinkey is a no-op on an unfocused box, so flipping both is safe and
+            // flip_blinkey is a no-op on an unfocused box, so flipping all is safe and
             // covers whichever currently holds focus.
             let a = self.formula_box.flip_blinkey();
-            let b = self.duration_box.flip_blinkey();
-            if a || b {
+            let b = self.base_box.flip_blinkey();
+            let c = self.duration_box.flip_blinkey();
+            if a || b || c {
                 needs_redraw = true;
             }
         }
@@ -931,12 +975,25 @@ impl PlotypusApp {
         let text = &mut *ctx.text;
         let response = widget::dispatch_key(self as &mut dyn Container, focus_id, kev, mods, text);
 
-        if matches!(response, EventResponse::Handled)
-            && (focus_id == self.formula_box.hit_id() || focus_id == self.duration_box.hit_id())
-        {
-            // Keep the cursor solid + blink-restarted while actively typing.
-            self.blink.start(Instant::now());
-            ctx.window.request_redraw();
+        if matches!(response, EventResponse::Handled) {
+            if focus_id == self.base_box.hit_id() {
+                // The base box holds a single char. Adopt the last char typed as the new
+                // base (if it maps to 2..=36), collapse the box back to one char, and
+                // re-parse + relabel immediately so the plot reflects the new base.
+                let typed = self.base_box.chars.last().copied();
+                self.base = typed.and_then(formula::char_to_base).unwrap_or(self.base);
+                self.base_box.clear();
+                self.base_box.insert_char(formula::base_to_char(self.base), &mut *ctx.text);
+                self.reparse_formula();
+            }
+            if focus_id == self.formula_box.hit_id()
+                || focus_id == self.base_box.hit_id()
+                || focus_id == self.duration_box.hit_id()
+            {
+                // Keep the cursor solid + blink-restarted while actively typing.
+                self.blink.start(Instant::now());
+                ctx.window.request_redraw();
+            }
         }
         response
     }

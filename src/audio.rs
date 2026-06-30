@@ -2,12 +2,15 @@
 //!
 //! `play(samples)` takes a mono `f32` buffer (as produced by `synth::PhotonVoice::render`)
 //! and plays it once on the default output device, resampled trivially to the device's
-//! native rate and fanned out to however many channels it wants. Playback runs on
-//! cpal's own audio thread; `play` blocks the calling thread until the buffer is drained
-//! so the synth → speaker path is a single synchronous call from the UI hotkey.
+//! native rate and fanned out to however many channels it wants.
 //!
-//! Errors are deliberately swallowed into a `Result` with a human string rather than
-//! panicking — a missing audio device should never take the plotter window down.
+//! **Non-blocking:** `play` spawns a background thread that owns the cpal stream and waits
+//! out the buffer, then returns immediately — so the UI thread keeps going and the plot
+//! redraws right away instead of stalling until the sound finishes. Building the stream
+//! inside the spawned thread also sidesteps cpal's `Stream: !Send` on some backends.
+//!
+//! Errors are logged (a missing audio device should never take the plotter window down)
+//! rather than surfaced — there's no synchronous caller left to return them to.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,14 +19,24 @@ use std::time::{Duration, Instant};
 
 use crate::synth::SAMPLE_RATE;
 
-/// Play a mono `f32` buffer once, blocking until it finishes (or a safety timeout).
-/// `samples` are assumed to be at [`SAMPLE_RATE`]; if the device runs at a different
-/// rate we nearest-neighbour resample on the fly — fine for a sub-second notification.
-pub fn play(samples: Vec<f32>) -> Result<(), String> {
+/// Play a mono `f32` buffer once on a background thread, returning immediately. `samples`
+/// are assumed to be at [`SAMPLE_RATE`]; if the device runs at a different rate we
+/// nearest-neighbour resample on the fly. Errors are logged, not returned.
+pub fn play(samples: Vec<f32>) {
     if samples.is_empty() {
-        return Ok(());
+        return;
     }
+    std::thread::spawn(move || {
+        if let Err(e) = play_blocking(samples) {
+            eprintln!("audio: {e}");
+        }
+    });
+}
 
+/// The actual device setup + stream + drain. Runs entirely on the spawned thread (so the
+/// non-`Send` cpal `Stream` never crosses a thread boundary). Blocks that thread until the
+/// buffer drains or a safety timeout elapses.
+fn play_blocking(samples: Vec<f32>) -> Result<(), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()

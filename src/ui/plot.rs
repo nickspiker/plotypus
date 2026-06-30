@@ -4,8 +4,18 @@
 use crate::formula::{self, Token};
 use crate::ui::theme;
 use fluor::canvas::{Canvas, Damage};
+use fluor::paint::Clip;
+use fluor::pixel::Blend;
 use fluor::text::TextRenderer;
+use fluor::BlendMode;
 use spirix::ScalarF4E3 as S43;
+
+/// Complement of the RGB bytes — converts a visible-RGB colour to fluor's darkness
+/// convention (and vice-versa, it's an involution). Alpha is untouched.
+#[inline]
+const fn darken(visible_rgb: u32) -> u32 {
+    visible_rgb ^ 0x00FF_FFFF
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
@@ -50,24 +60,27 @@ pub fn draw_plot(
     label_font_size: f32,
     formula: Option<&[Token]>,
     parse_failed: bool,
+    base: u8,
 ) {
-    fill_rect(pixels, window_width, rect, 0xFF_00_00_00);
     // Parse error → blank black plot region. Skipping grid + labels + curve makes "your formula didn't parse" obvious at a glance, distinct from a valid expression that happens to evaluate offscreen.
     if parse_failed {
-        visible_to_darkness_rect(pixels, window_width, rect);
+        fill_bg(pixels, window_width, rect);
         return;
     }
+    // Everything composites in fluor's native darkness convention via `under` (topmost
+    // paints first wins), so we draw front-to-back: axis labels on top, then the grid,
+    // then the curve fill, then the black background fills whatever is still transparent
+    // beneath them. No visible-RGB working buffer, no whole-rect XOR.
+    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size, base);
     draw_dyadic_grid(pixels, window_width, rect, view);
     if let Some(tokens) = formula {
         // Eval errors (stack underflow, etc.) shouldn't fire on a token vector that
         // tokenize() accepted — but if they do, fall back to INFINITY so the column
         // shows as a yellow stripe (visible, not crashy).
-        let curve = |x: S43| formula::evaluate(tokens, x).unwrap_or(S43::INFINITY);
+        let curve = |x: S43| formula::evaluate(tokens, x, base).unwrap_or(S43::INFINITY);
         draw_curve(pixels, window_width, rect, view, curve);
     }
-    // All the grid/curve/fill math above runs in plain visible-RGB (black base, additive brightness). Flip the rect to Fluor's darkness convention once here — the single import-boundary flip the pixel-format contract expects — before the label pass (which goes through Fluor's text renderer and already speaks darkness).
-    visible_to_darkness_rect(pixels, window_width, rect);
-    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size);
+    fill_bg(pixels, window_width, rect);
 }
 
 /// Same as [`draw_plot`] but plots an arbitrary `curve: Fn(S43) -> S43` instead of a
@@ -83,22 +96,25 @@ pub fn draw_plot_curve(
     rect: Rect,
     view: PlotView,
     label_font_size: f32,
+    base: u8,
     curve: impl Fn(S43) -> S43,
 ) {
-    fill_rect(pixels, window_width, rect, 0xFF_00_00_00);
+    // Front-to-back, all darkness + `under` (see `draw_plot`): labels, grid, curve, bg.
+    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size, base);
     draw_dyadic_grid(pixels, window_width, rect, view);
     draw_curve(pixels, window_width, rect, view, curve);
-    // Flip visible-RGB → Fluor darkness convention once, before the (already-darkness) label pass. See `draw_plot`.
-    visible_to_darkness_rect(pixels, window_width, rect);
-    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size);
+    fill_bg(pixels, window_width, rect);
 }
 
-/// Complement the RGB bytes of every pixel in `rect` in place (`pixel ^= 0x00FFFFFF`), keeping α. Converts the plot's visible-RGB working buffer into Fluor's darkness-convention buffer (`0 = white potential`, `255 = black ink`) at the plot's import boundary. Called once per frame after all raw pixel writes, before text.
-fn visible_to_darkness_rect(pixels: &mut [u32], window_width: usize, rect: Rect) {
+/// Fill the plot rect with opaque black, in darkness convention, via `under` — so it lands
+/// only on pixels still transparent after the labels / grid / curve drew on top. Opaque
+/// black in darkness is `0xFF_FF_FF_FF` (α opaque, RGB = max darkness).
+fn fill_bg(pixels: &mut [u32], window_width: usize, rect: Rect) {
     for y in rect.y..rect.y + rect.h {
         let row = y * window_width;
         for x in rect.x..rect.x + rect.w {
-            pixels[row + x] ^= 0x00FF_FFFF;
+            let idx = row + x;
+            pixels[idx] = pixels[idx].under(0xFF_FF_FF_FF, BlendMode::Normal);
         }
     }
 }
@@ -119,10 +135,13 @@ pub fn draw_curve(
     curve: impl Fn(S43) -> S43,
 ) {
     const SUBSAMPLES: usize = 32;
-    // Fill colours overwrite the entire column; high alpha so the result is opaque on top of the bg.
-    const FILL_UNDEFINED: u32 = 0xFF_E0_00_E0; // magenta
-    const FILL_INFINITY: u32 = 0xFF_E0_E0_00; // yellow
-    const FILL_ZERO: u32 = 0xFF_00_E0_00; // green
+    // Opaque fills in darkness convention (complement of the visible magenta/yellow/green).
+    const FILL_UNDEFINED: u32 = 0xFF00_0000 | darken(0x00_E0_00_E0); // magenta
+    const FILL_INFINITY: u32 = 0xFF00_0000 | darken(0x00_E0_E0_00); // yellow
+    const FILL_ZERO: u32 = 0xFF00_0000 | darken(0x00_00_E0_00); // green
+    // Darkness RGB of the normal pink (positive) / blue (negative) fills.
+    let pos_rgb = darken(state_colour(S43::ONE)); // FF8080 → darkness
+    let neg_rgb = darken(state_colour(S43::NEG_ONE)); // 8080FF → darkness
 
     let x_range = view.x_max - view.x_min;
     let y_range = view.y_max - view.y_min;
@@ -133,17 +152,31 @@ pub fn draw_curve(
     let rect_h = rect.h as f32;
     let bottom_row = rect.y + rect.h;
 
+    // Per-row supersample coverage for this column, split by sign so a zero-crossing
+    // column blends pink + blue correctly. Each subsample contributes up to 1.0 per row
+    // (fractional on the curve's sub-pixel top row); the column's alpha is coverage/32.
+    let mut cov_pos = vec![0f32; rect.h];
+    let mut cov_neg = vec![0f32; rect.h];
+
     for px in 0..rect.w {
+        cov_pos.iter_mut().for_each(|c| *c = 0.0);
+        cov_neg.iter_mut().for_each(|c| *c = 0.0);
         let abs_px = rect.x + px;
         let x = px * x_scale;
         let mut fill: Option<u32> = None;
+        // Whether the column fill runs from the y=0 line down (true) or full-height (false).
+        let mut fill_from_zero = false;
 
         for ss in 0..SUBSAMPLES {
             let frac_x = x + ss * frac_scale;
             let world_x = view.x_min + frac_x;
             let world_y = curve(world_x);
 
-            // Three states overwrite the entire column rather than contribute to the strip: undefined (magenta), infinity (yellow), exact zero (green) — they're singularities the eye should catch instantly.
+            // Off-scale / singular states fill the column as a solid marker rather than
+            // joining the area strip. Full-height: undefined (magenta), infinity (yellow),
+            // exploded (phase-scaled red/blue) — blow past the view. From y=0 down: zero
+            // (green), vanished (phase-scaled red/blue) — ≈0, so they fill what a
+            // zero-valued curve would. `0xFF00_0000 |` makes the phase colour opaque.
             if world_y.is_undefined() {
                 fill = Some(FILL_UNDEFINED);
                 break;
@@ -154,75 +187,116 @@ pub fn draw_curve(
             }
             if world_y.is_zero() {
                 fill = Some(FILL_ZERO);
+                fill_from_zero = true;
+                break;
+            }
+            if world_y.is_exploded() {
+                fill = Some(0xFF00_0000 | darken(state_colour(world_y)));
+                break;
+            }
+            if world_y.is_vanished() {
+                fill = Some(0xFF00_0000 | darken(state_colour(world_y)));
+                fill_from_zero = true;
                 break;
             }
 
-            let colour = state_colour(world_y);
-            let r_inc = ((colour >> 16) & 0xFF) / SUBSAMPLES as u32;
-            let g_inc = ((colour >> 8) & 0xFF) / SUBSAMPLES as u32;
-            let b_inc = (colour & 0xFF) / SUBSAMPLES as u32;
-
-            // Decide the curve's relation to the view in S43 — `curve_frac` can be far outside [0, 1], so the case test must run in scalar space before we drop to f32.
+            // Normal value: accumulate area coverage from the curve's pixel-y down.
+            // `curve_frac` can be far outside [0, 1], so the case test runs in S43 before
+            // we drop to f32.
             let curve_frac = (world_y - view.y_min) / y_range;
             if curve_frac < 0 {
-                continue;
+                continue; // curve below the view → no fill this subsample
             }
-
-            let (r_first, top_cov) = if curve_frac > 1 {
-                (rect.y, 1.0_f32)
+            let cov = if world_y.is_positive() {
+                &mut cov_pos
+            } else {
+                &mut cov_neg
+            };
+            if curve_frac > 1 {
+                // Curve above the view → fills the whole on-screen column.
+                cov.iter_mut().for_each(|c| *c += 1.0);
             } else {
                 let frac_f = curve_frac.to_f32();
                 let curve_pix_y = rect_y + (1. - frac_f) * rect_h;
                 let top_row = curve_pix_y as usize;
-                let cov = 1. - (curve_pix_y - curve_pix_y.floor());
-                (top_row, cov)
-            };
-
-            for r in r_first..bottom_row {
-                let coverage = if r == r_first { top_cov } else { 1. };
-                let cov = (coverage * 256.) as u32;
-                let contribution = (((r_inc * cov) >> 8) << 16)
-                    | (((g_inc * cov) >> 8) << 8)
-                    | ((b_inc * cov) >> 8);
-                let idx = r * window_width + abs_px;
-                pixels[idx] = pixels[idx].wrapping_add(contribution);
+                let top_cov = 1. - (curve_pix_y - curve_pix_y.floor());
+                if top_row >= rect.y && top_row < bottom_row {
+                    cov[top_row - rect.y] += top_cov;
+                }
+                for r in (top_row + 1).max(rect.y)..bottom_row {
+                    cov[r - rect.y] += 1.0;
+                }
             }
         }
 
         if let Some(colour) = fill {
-            for r in rect.y..bottom_row {
+            // `fill_from_zero` (zero + vanished) → from the y=0 line down, the area a ≈0
+            // curve covers. Otherwise (undefined / infinity / exploded) → full column.
+            let top = if fill_from_zero {
+                let zero_py = map_y(view, rect, S43::ZERO);
+                zero_py.clamp(rect.y as i32, bottom_row as i32) as usize
+            } else {
+                rect.y
+            };
+            for r in top..bottom_row {
                 let idx = r * window_width + abs_px;
-                pixels[idx] = colour;
+                pixels[idx] = pixels[idx].under(colour, BlendMode::Normal);
+            }
+        } else {
+            // Normal area-fill: under-blend pink / blue per row at α = coverage/32 (so the
+            // 32 supersamples antialias the curve's sloped top edge). The plot is drawn
+            // topmost-first, so this composites UNDER the labels + grid already in place.
+            let inv = 255.0 / SUBSAMPLES as f32;
+            for i in 0..rect.h {
+                let idx = (rect.y + i) * window_width + abs_px;
+                let cp = cov_pos[i];
+                if cp > 0.0 {
+                    let a = (cp * inv).min(255.0) as u32;
+                    pixels[idx] = pixels[idx].under((a << 24) | pos_rgb, BlendMode::Normal);
+                }
+                let cn = cov_neg[i];
+                if cn > 0.0 {
+                    let a = (cn * inv).min(255.0) as u32;
+                    pixels[idx] = pixels[idx].under((a << 24) | neg_rgb, BlendMode::Normal);
+                }
             }
         }
     }
 }
 
-/// Additive contribution colour for a finite, non-undefined, non-zero scalar. Channel goes into R for positive states, B for negative states. Brightness encodes magnitude class:
-///   - vanished:  0x20..=0x5E  (faint — values dwarfed past the exponent floor)
-///   - normal:    0x70         (mid — definite magnitude)
-///   - exploded:  0x80..=0xFE  (bright — values past the exponent ceiling)
+/// Colour (24-bit `0x00RRGGBB`, visible-RGB) for a finite, non-undefined, non-infinite,
+/// non-zero scalar, by magnitude class. Positive → red channel, negative → blue channel:
+///   - **normal**:   fixed `FF8080` (pos) / `8080FF` (neg) — a definite, on-scale value.
+///   - **vanished**: phase-scaled single channel `40..80` (pos R / neg B) — `[↓]`, dwarfed past the exponent floor.
+///   - **exploded**: phase-scaled single channel `B0..FF` (pos R / neg B) — `[↑]`, past the exponent ceiling.
 ///
-/// Within vanished/exploded the gradient is read from the fraction prefix (top byte of `Scalar.fraction`). Positive prefix bits `01xxxxxx` (exploded) or `001xxxxx` (vanished); shifting left by 1 maps those into the desired top-channel byte. Negative prefix bits `10xxxxxx` / `110xxxxx`; bit-not flips them to the positive shape, then the same shift produces the gradient. Spirix's `prefix()` is `pub(crate)`, so we read the top byte directly via `(fraction >> 8) as i8` — adjust the shift to `(F_BITS − 8)` for other Scalar widths.
+/// The phase is the value's position *within* its class, read from the fraction prefix
+/// (top byte of `Scalar.fraction`). Class bit shapes (Spirix `class_xor`): positive
+/// `01xxxxxx` exploded / `001xxxxx` vanished; negatives are the bitwise-NOT shapes
+/// (`10xxxxxx` / `110xxxxx`), so `!prefix` maps a negative back onto the positive shape
+/// and one extraction serves both signs. Spirix's `prefix()` is `pub(crate)`, so we read
+/// the top byte directly via `(fraction >> 8) as i8` — adjust the shift to `(F_BITS − 8)`
+/// for other Scalar widths.
 fn state_colour(world_y: S43) -> u32 {
     let prefix: i8 = (world_y.fraction >> 8) as i8;
     let pos = world_y.is_positive();
-    let mag: u8 = if world_y.is_exploded() {
-        if pos {
-            (prefix as u8) << 1
-        } else {
-            (!prefix as u8) << 1
-        }
+    // Fold negatives onto the positive class shape so one phase extraction works for both.
+    let p: u8 = if pos { prefix as u8 } else { !(prefix as u8) };
+
+    if world_y.is_exploded() {
+        // 01xxxxxx → phase ∈ [0,0x3F]; map to channel [0xB0, 0xFF].
+        let phase = p.wrapping_sub(0x40) as u32 & 0x3F;
+        let c = 0xB0 + phase * 0x4F / 0x3F;
+        if pos { c << 16 } else { c }
     } else if world_y.is_vanished() {
-        if pos {
-            ((prefix as u8) << 1).wrapping_sub(0x20)
-        } else {
-            ((!prefix as u8) << 1).wrapping_sub(0x20)
-        }
+        // 001xxxxx → phase ∈ [0,0x1F]; map to channel [0x40, 0x80].
+        let phase = p.wrapping_sub(0x20) as u32 & 0x1F;
+        let c = 0x40 + phase * 0x40 / 0x1F;
+        if pos { c << 16 } else { c }
     } else {
-        0x70
-    };
-    if pos { (mag as u32) << 16 } else { mag as u32 }
+        // Normal: definite magnitude, fixed pink (pos) / blue (neg).
+        if pos { 0x00_FF_80_80 } else { 0x00_80_80_FF }
+    }
 }
 
 /// World coords under a screen point inside the plot rect. Screen coords arrive from winit as f32 and convert to the plot's S43 world coords here.
@@ -234,14 +308,6 @@ pub fn screen_to_world(rect: Rect, view: PlotView, sx: f32, sy: f32) -> (S43, S4
     (wx, wy)
 }
 
-fn fill_rect(pixels: &mut [u32], window_width: usize, r: Rect, colour: u32) {
-    for y in r.y..r.y + r.h {
-        let row = y * window_width;
-        for x in r.x..r.x + r.w {
-            pixels[row + x] = colour;
-        }
-    }
-}
 
 #[inline]
 fn map_x(view: PlotView, rect: Rect, vx: S43) -> i32 {
@@ -257,7 +323,6 @@ fn map_y(view: PlotView, rect: Rect, vy: S43) -> i32 {
 
 /// Scale-aware dyadic grid. Each axis derives its own primary spacing directly from the visible range — `primary = 2^floor(log2(width))` — and 8 halving levels descend from there with brightness 128, 64, 32, ..., 1. Level 0 draws lines at every multiple of `primary`; deeper levels add new lines at odd multiples of `primary / 2^level`, i.e. the midpoints of the previous level. No depth search and no density cutoff: line counts per axis are bounded by construction (~2× per level), so zoom-out can't wash out and zoom-in can't go blank — the grid pattern stays consistent at every scale. Lines are drawn dim-first so brighter levels overwrite dimmer at crossings.
 fn draw_dyadic_grid(pixels: &mut [u32], window_width: usize, rect: Rect, view: PlotView) {
-    let bg = 0;
 
     let x_range = view.x_max - view.x_min;
     let y_range = view.y_max - view.y_min;
@@ -281,11 +346,15 @@ fn draw_dyadic_grid(pixels: &mut [u32], window_width: usize, rect: Rect, view: P
         queue[idx] = (brightness, true, y_primary / factor, level_zero);
         idx += 1;
     }
-    // Stable sort by brightness ascending. queue is short (16) so cost is trivial.
-    queue.sort_by_key(|&(b, _, _, _)| b);
+    // Sort by brightness DESCENDING — under-blend is topmost-first, so the brightest lines
+    // must draw first to win at crossings (the inverse of the old overwrite ordering).
+    queue.sort_by_key(|&(b, _, _, _)| core::cmp::Reverse(b));
 
     for &(brightness, is_horizontal, spacing, level_zero) in queue.iter() {
-        let colour = blend_white_onto(bg, brightness);
+        // Translucent white grid line in darkness convention: α = brightness, RGB = 0
+        // (white). Under-blends over whatever's beneath (black bg or the curve fill), so
+        // the grid reads through the fill the way the old additive version did.
+        let colour = (brightness << 24) | 0x00_00_00_00;
         if is_horizontal {
             draw_y_lines(
                 pixels,
@@ -320,6 +389,7 @@ fn draw_axis_labels(
     rect: Rect,
     view: PlotView,
     font_size: f32,
+    base: u8,
 ) {
     let x_range = view.x_max - view.x_min;
     let y_range = view.y_max - view.y_min;
@@ -367,28 +437,28 @@ fn draw_axis_labels(
     // Level 0 (primary), level 1 (primary/2 odd), level 2 (primary/4 odd).
     draw_x_labels_at_level(
         &mut canvas, text_renderer, rect, view, x_primary, true,
-        x_label_baseline, s0,
+        x_label_baseline, s0, base,
     );
     draw_x_labels_at_level(
         &mut canvas, text_renderer, rect, view, x_primary >> 1u8, false,
-        x_label_baseline, s1,
+        x_label_baseline, s1, base,
     );
     draw_x_labels_at_level(
         &mut canvas, text_renderer, rect, view, x_primary >> 2u8, false,
-        x_label_baseline, s2,
+        x_label_baseline, s2, base,
     );
 
     draw_y_labels_at_level(
         &mut canvas, text_renderer, rect, view, y_primary, true,
-        y_label_x, align_left, s0,
+        y_label_x, align_left, s0, base,
     );
     draw_y_labels_at_level(
         &mut canvas, text_renderer, rect, view, y_primary >> 1u8, false,
-        y_label_x, align_left, s1,
+        y_label_x, align_left, s1, base,
     );
     draw_y_labels_at_level(
         &mut canvas, text_renderer, rect, view, y_primary >> 2u8, false,
-        y_label_x, align_left, s2,
+        y_label_x, align_left, s2, base,
     );
 }
 
@@ -401,6 +471,7 @@ fn draw_x_labels_at_level(
     level_zero: bool,
     baseline_y: f32,
     font_size: f32,
+    base: u8,
 ) {
     let plot_lft = rect.x as i32;
     let plot_rgt = (rect.x + rect.w) as i32;
@@ -414,7 +485,13 @@ fn draw_x_labels_at_level(
         if px <= plot_lft + 4 || px >= plot_rgt - 4 {
             continue;
         }
-        let label = format!("{:4.12}", v);
+        // Spirix Display takes the format precision as the output base — `{:4.base$}`
+        // renders `v` in `base` with up to 4 digits, matching the parsing base.
+        let label = format!("{:4.base$}", v, base = base as usize);
+        // Plain under-blend: the plot is drawn topmost-first, so labels are painted FIRST
+        // onto the transparent rect and the grid/curve/bg compose beneath them — they end
+        // up on top with no hacks. Darkness-convention colour; clip to the plot rect.
+        let clip = Some(Clip::new(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h));
         text_renderer.draw_text_center_u32(
             canvas,
             &label,
@@ -424,7 +501,7 @@ fn draw_x_labels_at_level(
             400,
             theme::TEXT_COLOUR ^ 0x00FF_FFFF,
             theme::FONT_UI,
-            None,
+            clip,
             None,
             None,
         );
@@ -441,6 +518,7 @@ fn draw_y_labels_at_level(
     label_x: f32,
     align_left: bool,
     font_size: f32,
+    base: u8,
 ) {
     let plot_top = rect.y as i32;
     let plot_bot = (rect.y + rect.h) as i32;
@@ -454,35 +532,20 @@ fn draw_y_labels_at_level(
         if py <= plot_top + (font_size as i32) || py >= plot_bot - 4 {
             continue;
         }
-        let label = format!("{:4.12}", v);
+        let label = format!("{:4.base$}", v, base = base as usize);
         let baseline_y = py as f32 - 2.0;
+        // Under-blend on top (labels drawn first); darkness colour, clipped. See x-labels.
+        let clip = Some(Clip::new(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h));
+        let colour = theme::TEXT_COLOUR ^ 0x00FF_FFFF;
         if align_left {
             text_renderer.draw_text_left_u32(
-                canvas,
-                &label,
-                label_x,
-                baseline_y,
-                font_size,
-                400,
-                theme::TEXT_COLOUR ^ 0x00FF_FFFF,
-                theme::FONT_UI,
-                None,
-                None,
-                None,
+                canvas, &label, label_x, baseline_y, font_size, 400, colour,
+                theme::FONT_UI, clip, None, None,
             );
         } else {
             text_renderer.draw_text_right_u32(
-                canvas,
-                &label,
-                label_x,
-                baseline_y,
-                font_size,
-                400,
-                theme::TEXT_COLOUR ^ 0x00FF_FFFF,
-                theme::FONT_UI,
-                None,
-                None,
-                None,
+                canvas, &label, label_x, baseline_y, font_size, 400, colour,
+                theme::FONT_UI, clip, None, None,
             );
         }
     }
@@ -562,25 +625,15 @@ fn line_ks(lo: S43, hi: S43, spacing: S43, level_zero: bool) -> (i64, i64, bool)
 
 fn draw_v_line(pixels: &mut [u32], window_width: usize, rect: Rect, x: usize, colour: u32) {
     for y in (rect.y + 1)..(rect.y + rect.h - 1) {
-        pixels[y * window_width + x] = colour;
+        let idx = y * window_width + x;
+        pixels[idx] = pixels[idx].under(colour, BlendMode::Normal);
     }
 }
 
 fn draw_h_line(pixels: &mut [u32], window_width: usize, rect: Rect, y: usize, colour: u32) {
     let row = y * window_width;
     for x in (rect.x + 1)..(rect.x + rect.w - 1) {
-        pixels[row + x] = colour;
+        let idx = row + x;
+        pixels[idx] = pixels[idx].under(colour, BlendMode::Normal);
     }
-}
-
-/// Alpha-blend opaque white onto `bg` with `intensity` (0..=255 alpha).
-fn blend_white_onto(bg: u32, intensity: u32) -> u32 {
-    let bg_r = (bg >> 16) & 0xFF;
-    let bg_g = (bg >> 8) & 0xFF;
-    let bg_b = bg & 0xFF;
-    let inv = 256 - intensity;
-    let r = (bg_r * inv + 255 * intensity) >> 8;
-    let g = (bg_g * inv + 255 * intensity) >> 8;
-    let b = (bg_b * inv + 255 * intensity) >> 8;
-    0xFF000000 | (r << 16) | (g << 8) | b
 }
