@@ -67,11 +67,13 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
     ("^", '^', 2, "exponentiation"),
     ("%", '%', 2, "modulus"),
     ("$", '$', 2, "logarithm (number$base = log base of number)"),
-    // Bitwise logic — Spirix's two's-complement ops aligned at the binary point. Lowest
-    // precedence (looser than + -), like C. `^` is taken by exponentiation, so xor is `~`.
+    // Bitwise logic — Spirix's two's-complement ops aligned at the binary point. Binary
+    // `& | ~` are lowest precedence (looser than + -), like C. `^` is taken by
+    // exponentiation, so xor is `~`. `!` is unary prefix bitwise NOT.
     ("&", '&', 2, "bitwise and"),
     ("|", '|', 2, "bitwise or"),
     ("~", '~', 2, "bitwise xor"),
+    ("!", '!', 1, "bitwise not"),
     // Parentheses
     ("(", '(', 1, "left parenthesis"),
     (")", ')', 1, "right parenthesis"),
@@ -307,7 +309,7 @@ fn apply_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
         '+' | '-' | '*' | '/' | '^' | '%' | '$' | '&' | '|' | '~' => {
             apply_binary_operator(output_queue, op)?
         }
-        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
+        'n' | '!' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
         | 't' => {
             if let Some(value) = output_queue.pop() {
                 let result = apply_unary_operator(op, value)?;
@@ -327,7 +329,7 @@ fn get_precedence(op: char) -> Precedence {
         '+' | '-' => Precedence::Addition,
         '*' | '/' | '%' => Precedence::Multiplication,
         '^' | '$' => Precedence::Exponentiation,
-        'n' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
+        'n' | '!' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
         | 't' => Precedence::Unary,
         '(' | ')' => Precedence::Parenthesis,
         _ => Precedence::Addition,
@@ -341,6 +343,7 @@ fn get_precedence(op: char) -> Precedence {
 fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
     let result = match op {
         'n' => -value,
+        '!' => !value,
         'a' => value.magnitude(),
         'S' => value.asin(),
         'O' => value.acos(),
