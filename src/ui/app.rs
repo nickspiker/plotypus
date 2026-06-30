@@ -1,229 +1,279 @@
+//! `PlotypusApp` — the `fluor::host::app::FluorApp` that drives Plotypus.
+//!
+//! Fluor owns the window, event loop, CPU present buffer, chrome (titlebar / window
+//! controls / drag / resize edges), text rendering, hit-testing, and the blink timer.
+//! Plotypus owns the domain: a formula `Textbox`, a "play" `Button`, the plot region,
+//! pan/zoom on the plot, and the Photon-notification synth/audio.
+//!
+//! Layout (top → bottom): chrome bar, then a row holding the formula textbox with the
+//! play button to its right, then the plot fills the rest. The plot draws straight into
+//! the host's `target: &mut [u32]` in `render`.
+
 use crate::formula::{self, ParseError, Token};
-use crate::ui::compositing::{
-    HIT_BASE_BOX, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON,
-    HIT_RANGE_XMIN, HIT_RANGE_XMAX, HIT_RANGE_YMIN, HIT_RANGE_YMAX,
+use crate::synth::{self, PhotonVoice};
+use crate::ui::plot::{self, PlotView, Rect};
+
+use fluor::canvas::{Canvas, PixelRect};
+use fluor::coord::Coord;
+use fluor::event::{
+    CursorIcon, ElementState, Event, Key, KeyEvent, ModifiersState, MouseButton, NamedKey,
 };
-use crate::ui::input_box::{
-    self, InputLayout, TextState, draw_chrome, draw_value_chrome, recompute_widths,
-    render_blinkey, render_text, render_value_text,
-};
-use crate::ui::plot::{PlotView, Rect, draw_plot, screen_to_world};
-use crate::ui::renderer::Renderer;
-use crate::ui::text_rasterizing::TextRenderer;
-use crate::ui::{compositing, drawing, theme};
-use rand::Rng;
+use fluor::geom::Viewport;
+use fluor::host::app::{Context, EventResponse, FluorApp};
+use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
+use fluor::host::chrome_widget::DefaultChrome;
+use fluor::host::widget::{self as widget, Container, TabDir, Widget};
+use fluor::widgets::{BlinkTimer, Button, Textbox};
 use spirix::ScalarF4E3 as S43;
-use std::time::{Duration, Instant};
-use winit::dpi::PhysicalSize;
-use winit::keyboard::ModifiersState;
-use winit::window::Window;
+use std::time::Instant;
 
 const DEFAULT_FORMULA: &str = "#sin(x*@pi*2)*0.7";
+/// Default play duration in seconds (decimal, base 10 — this box is plain seconds, not a
+/// dozenal formula value). Seeds the duration box.
+const DEFAULT_DURATION: &str = "1.05";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoveredButton {
-    None,
-    Close,
-    Maximize,
-    Minimize,
-    Body,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusedBox {
-    None,
-    Formula,
-    Base,
-    RangeXMin,
-    RangeXMax,
-    RangeYMin,
-    RangeYMax,
-}
-
+/// Pan or zoom drag in progress on the plot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlotDragMode {
     Pan,
     Zoom,
+    /// Right-drag: adjust the x/y aspect ratio — horizontal motion scales the x-extent,
+    /// vertical motion scales the y-extent, each anchored at the cursor.
+    Aspect,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PlotDrag {
-    pub mode: PlotDragMode,
-    /// Screen-space cursor position when the drag started.
-    pub start_x: f32,
-    pub start_y: f32,
-    /// World coords under the cursor when the drag started (for zoom anchoring).
-    pub anchor_world_x: S43,
-    pub anchor_world_y: S43,
-    /// View bounds at the moment the drag started (for zoom — pan integrates incrementally).
-    pub start_view: PlotView,
+struct PlotDrag {
+    mode: PlotDragMode,
+    /// Cursor position when the drag started (zoom anchors here).
+    start_x: Coord,
+    start_y: Coord,
+    /// World coords under the cursor at drag start (zoom anchoring).
+    anchor_world_x: S43,
+    anchor_world_y: S43,
+    /// View bounds when the drag started.
+    start_view: PlotView,
     /// Last-frame cursor position for incremental pan deltas.
-    pub last_x: f32,
-    pub last_y: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeEdge {
-    None,
-    Top,
-    Bottom,
-    Left,
-    Right,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
+    last_x: Coord,
+    last_y: Coord,
 }
 
 pub struct PlotypusApp {
-    pub width: u32,
-    pub height: u32,
-    pub renderer: Renderer,
-    pub text_renderer: TextRenderer,
-    pub is_fullscreen: bool,
-    pub frame_counter: u64,
-    pub window_dirty: bool,
-    /// Per-pixel hit-test map, indexed [y * width + x]
-    pub hit_test_map: Vec<u8>,
-    /// Zoom multiplier for chrome scaling (Photon's `ru` — responsive unit)
-    pub ru: f32,
-    /// Cached harmonic-mean dimension: 2*w*h/(w+h). Drives chrome sizing and edge thresholds.
-    pub span: f32,
+    title: String,
+    chrome: DefaultChrome,
+    /// Formula input. Its `chars` are the source of truth for the plotted expression.
+    formula_box: Textbox,
+    /// Duration input (seconds) — how long the play sweep takes to cross the viewed
+    /// x-range. Parsed as a plain decimal; falls back to `DEFAULT_DURATION` if invalid.
+    duration_box: Textbox,
+    /// "Play" button — evaluates + plays the typed formula as audio.
+    play_button: Button,
+    /// Monotonic dense hit-id counter shared by chrome + widgets.
+    hit_counter: HitId,
+    /// Currently focused widget id (keyboard target), or None.
+    current_focus: Option<HitId>,
+    blink: BlinkTimer,
 
-    // Input state
-    pub mouse_x: f32,
-    pub mouse_y: f32,
-    pub mouse_button_pressed: bool,
-    pub modifiers: ModifiersState,
-    pub hovered_button: HoveredButton,
-    pub prev_hovered_button: HoveredButton,
-    pub is_dragging_resize: bool,
-    pub resize_edge: ResizeEdge,
+    // --- Plot domain state ---
+    plot_view: PlotView,
+    plot_rect: Rect,
+    plot_drag: Option<PlotDrag>,
+    /// Last parse of the formula text. `None` = empty box (resting state); `Some(Err)` =
+    /// parse error (plot blanks); `Some(Ok)` = the plotted token vector.
+    formula: Option<Result<Vec<Token>, ParseError>>,
 
-    // Debug overlays
-    pub debug: bool,
-    pub debug_hit_test: bool,
-    pub show_textbox_mask: bool,
-    pub debug_hit_colours: Vec<(u8, u8, u8)>,
+    /// When `Some`, the plot shows this notification waveform (same S43 `voice(t)` the
+    /// speaker plays) instead of the typed formula. Cleared when the formula is edited.
+    notification: Option<PhotonVoice>,
+    /// Rotating seed so each play demos a different per-user sound.
+    notification_seed: u64,
 
-    // Formula input state — the source of truth for what the user has typed.
-    pub text_state: TextState,
-    /// Snapshot of `text_state` reflecting what is currently composited into `cpu_buffer`. Differential render subtracts using this then adds using `text_state`, then assigns this := text_state.
-    pub last_text_state: TextState,
-    /// Snapshot of the InputLayout used to draw `last_text_state` — needed so a resize can subtract from the *old* coordinates before the new layout is applied.
-    pub last_layout: Option<InputLayout>,
-    /// Single-channel mask (window-sized) marking the inside of the input box, used by `render_char_additive_u32` to clip glyphs to the textbox.
-    pub textbox_mask: Vec<u8>,
-    /// Set when text_state diverges from last_text_state (insert/delete/move).
-    pub text_dirty: bool,
-    /// Whether the blinkey is currently composited in `cpu_buffer`.
-    pub blinkey_visible: bool,
-    /// Random per-blink orientation: true = bright at the top of the wave. Set fresh on every ON-event, kept stable across the matching OFF-event so subtraction cancels the prior addition exactly.
-    pub blinkey_top_bright: bool,
-    /// Last blinkey position composited into `cpu_buffer` (for subtraction).
-    pub last_blinkey_x: usize,
-    pub last_blinkey_top: usize,
-    pub last_blinkey_height: usize,
-    /// Wall-clock instant of the next blink toggle. Drives the wakeup loop.
-    pub next_blink_time: Instant,
+    modifiers: ModifiersState,
+    is_maximized: bool,
+    /// True while a left-drag is extending a textbox selection (armed on press inside a
+    /// focused textbox, released on mouse-up).
+    is_dragging_select: bool,
 
-    // Plot
-    pub plot_view: PlotView,
-    pub plot_drag: Option<PlotDrag>,
-    /// Last successful parse of `text_state.chars`. `None` until the first parse runs (in `render`); `Some(Err(...))` means the user's input doesn't parse, in which case no curve is drawn.
-    pub formula: Option<Result<Vec<Token>, ParseError>>,
-
-    // Base
-    pub base: u8,
-
-    // Range input boxes (x_min, x_max, y_min, y_max)
-    pub range_text_states: [TextState; 4],
-    pub focused_box: FocusedBox,
+    /// `[`+`]` debug-chord tracker (see `ChordTracker`).
+    chord: ChordTracker,
+    /// `true` while the hit-map debug overlay (`[]h`) is on. Painted at the end of
+    /// `render` from `debug_hit_colours`.
+    show_hitmask: bool,
+    /// 256-entry random palette indexed by hit-id byte, regenerated each time the hitmask
+    /// overlay toggles on so distinct ids get visibly-distinct colours.
+    debug_hit_colours: Vec<u32>,
 }
 
-pub struct Layout {
-    pub formula_rect: Rect,
-    pub base_rect: Rect,
-    pub range_rects: [Rect; 4], // x_min, x_max, y_min, y_max
-    pub plot_rect: Rect,
+/// Grace after a bracket Release before we treat it as truly released. X11 fires a
+/// synthetic Release for a held key the instant another key is pressed; without this
+/// grace the chord would disarm a millisecond before the action key registers.
+const CHORD_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Tracks whether `[` and `]` are simultaneously held for the debug chord. A bracket is
+/// "held" if its last press is more recent than its last release, OR the release was
+/// within `CHORD_RELEASE_GRACE` (absorbs X11's synthetic-release-on-other-keypress).
+#[derive(Default)]
+struct ChordTracker {
+    lb_press: Option<Instant>,
+    lb_release: Option<Instant>,
+    rb_press: Option<Instant>,
+    rb_release: Option<Instant>,
 }
 
-fn compute_span(width: u32, height: u32) -> f32 {
-    let w = width as f32;
-    let h = height as f32;
-    2.0 * w * h / (w + h).max(1.0)
-}
-
-impl PlotypusApp {
-    pub fn new(window: &Window) -> Self {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
-        let renderer = Renderer::new(window, width, height);
-        Self {
-            width,
-            height,
-            renderer,
-            text_renderer: TextRenderer::new(),
-            is_fullscreen: false,
-            frame_counter: 0,
-            window_dirty: true,
-            hit_test_map: vec![compositing::HIT_BODY; (width * height) as usize],
-            ru: 1.0,
-            span: compute_span(width, height),
-            mouse_x: f32::NAN,
-            mouse_y: f32::NAN,
-            mouse_button_pressed: false,
-            modifiers: ModifiersState::empty(),
-            hovered_button: HoveredButton::None,
-            prev_hovered_button: HoveredButton::None,
-            is_dragging_resize: false,
-            resize_edge: ResizeEdge::None,
-            debug: false,
-            debug_hit_test: false,
-            show_textbox_mask: false,
-            debug_hit_colours: Vec::new(),
-            text_state: {
-                let mut t = TextState::new();
-                t.focused = true;
-                t.chars = DEFAULT_FORMULA.chars().collect();
-                // Widths are filled in by `recompute_widths` on the first render — do that work once we know the actual font size.
-                t.widths = vec![0; t.chars.len()];
-                t.blinkey_index = t.chars.len();
-                t
-            },
-            last_text_state: TextState::new(),
-            last_layout: None,
-            textbox_mask: vec![0u8; (width * height) as usize],
-            text_dirty: false,
-            blinkey_visible: false,
-            blinkey_top_bright: true,
-            last_blinkey_x: 0,
-            last_blinkey_top: 0,
-            last_blinkey_height: 0,
-            next_blink_time: Instant::now() + Duration::from_millis(300),
-            plot_view: PlotView::default(),
-            plot_drag: None,
-            formula: None,
-            base: formula::DEFAULT_BASE,
-            range_text_states: [
-                TextState::new(),
-                TextState::new(),
-                TextState::new(),
-                TextState::new(),
-            ],
-            focused_box: FocusedBox::Formula,
+impl ChordTracker {
+    fn note(&mut self, bracket: char, state: ElementState, now: Instant) {
+        match (bracket, state) {
+            ('[', ElementState::Pressed) => self.lb_press = Some(now),
+            ('[', ElementState::Released) => self.lb_release = Some(now),
+            (']', ElementState::Pressed) => self.rb_press = Some(now),
+            (']', ElementState::Released) => self.rb_release = Some(now),
+            _ => {}
         }
     }
 
-    /// Begin a pan or zoom drag anchored at the given screen position. Returns false if the position is outside the plot rect (caller should not start).
-    pub fn start_plot_drag(&mut self, mode: PlotDragMode, x: f32, y: f32) -> bool {
-        let layout = Self::compute_layout(self.width, self.height, self.button_height());
-        let plot_rect = layout.plot_rect;
-        if !point_in_rect(plot_rect, x, y) {
-            return false;
+    fn both_held(&self, now: Instant) -> bool {
+        fn held(press: Option<Instant>, release: Option<Instant>, now: Instant) -> bool {
+            match (press, release) {
+                (Some(p), Some(r)) => p > r || now.duration_since(r) < CHORD_RELEASE_GRACE,
+                (Some(_), None) => true,
+                _ => false,
+            }
         }
-        let (anchor_world_x, anchor_world_y) = screen_to_world(plot_rect, self.plot_view, x, y);
+        held(self.lb_press, self.lb_release, now) && held(self.rb_press, self.rb_release, now)
+    }
+}
+
+impl PlotypusApp {
+    pub fn new() -> Self {
+        // Placeholder viewport — real geometry lands in `init` once the host opens the
+        // window. Chrome claims hit ids 1..=N first; the widgets that follow get the rest.
+        let viewport = Viewport::new(1280, 800);
+        let mut hit_counter: HitId = HIT_NONE;
+        let chrome = DefaultChrome::new(
+            viewport,
+            "Plotypus".to_string(),
+            load_orb(),
+            Some("ready".to_string()),
+            &mut hit_counter,
+        );
+
+        let mut formula_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        formula_box.stroke_ru = 1.0 / 12.0;
+        // Seed the default formula. Widths get measured on the first `set_font_size`.
+        for c in DEFAULT_FORMULA.chars() {
+            formula_box.chars.push(c);
+        }
+        formula_box.cursor = formula_box.chars.len();
+
+        // Duration box: how many seconds the play sweep takes to cross the viewed x-range.
+        let mut duration_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        duration_box.stroke_ru = 1.0 / 12.0;
+        for c in DEFAULT_DURATION.chars() {
+            duration_box.chars.push(c);
+        }
+        duration_box.cursor = duration_box.chars.len();
+
+        let mut play_button =
+            Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0, "▶ play");
+        play_button.stroke_ru = 1.0 / 12.0;
+
+        Self {
+            title: "Plotypus".to_string(),
+            chrome,
+            formula_box,
+            duration_box,
+            play_button,
+            hit_counter,
+            current_focus: None,
+            blink: BlinkTimer::new(),
+            plot_view: PlotView::default(),
+            plot_rect: Rect { x: 0, y: 0, w: 0, h: 0 },
+            plot_drag: None,
+            formula: None,
+            notification: None,
+            notification_seed: 0,
+            modifiers: ModifiersState::empty(),
+            is_maximized: false,
+            is_dragging_select: false,
+            chord: ChordTracker::default(),
+            show_hitmask: false,
+            debug_hit_colours: Vec::new(),
+        }
+    }
+
+    /// Recompute widget + plot geometry from the viewport. Chrome reserves the top bar;
+    /// the formula box + play button sit on the next row; the plot fills the rest.
+    fn update_layout(&mut self, ctx: &mut Context) {
+        let vp = ctx.viewport;
+        let span = vp.effective_span();
+        let bw = span / 32.0; // chrome button-width unit; drives margins + row heights
+        let w = vp.width_px as Coord;
+
+        let margin = bw;
+        let row_h = bw * 2.0;
+        let gap = bw * 0.5;
+        // Chrome occupies roughly the top button row; start content below it.
+        let chrome_bar = bw * 2.0;
+        let row_cy = chrome_bar + gap + row_h * 0.5;
+
+        // Row layout, left→right: formula (flexible) · duration (fixed narrow) · play
+        // button (fixed). The formula box absorbs whatever width the other two leave.
+        let button_w = (bw * 8.0).min(w * 0.25);
+        let dur_w = (bw * 5.0).min(w * 0.15);
+        let content_w = w - margin * 2.0;
+        let tb_w = (content_w - dur_w - button_w - gap * 2.0).max(bw * 4.0);
+
+        let tb_cx = margin + tb_w * 0.5;
+        let dur_cx = margin + tb_w + gap + dur_w * 0.5;
+        let btn_cx = margin + tb_w + gap + dur_w + gap + button_w * 0.5;
+        let font_size = bw;
+
+        self.formula_box.set_rect(tb_cx, row_cy, tb_w, row_h);
+        self.formula_box.set_font_size(font_size, ctx.text);
+        self.duration_box.set_rect(dur_cx, row_cy, dur_w, row_h);
+        self.duration_box.set_font_size(font_size, ctx.text);
+        self.play_button.set_rect(btn_cx, row_cy, button_w, row_h);
+        self.play_button.set_font_size(font_size);
+
+        // Plot fills from below the content row to the bottom margin.
+        let plot_top = (row_cy + row_h * 0.5 + gap) as usize;
+        let plot_x = margin as usize;
+        let plot_w = (content_w) as usize;
+        let plot_bottom = (vp.height_px as Coord - margin) as usize;
+        let plot_h = plot_bottom.saturating_sub(plot_top);
+        self.plot_rect = Rect { x: plot_x, y: plot_top, w: plot_w, h: plot_h };
+    }
+
+    /// Re-parse the formula box into `self.formula`. Empty box → resting state (None),
+    /// so the grid + labels stay visible. Editing also exits notification view.
+    fn reparse_formula(&mut self) {
+        let text: String = self.formula_box.chars.iter().collect();
+        self.formula = if text.trim().is_empty() {
+            None
+        } else {
+            Some(formula::parse(&text))
+        };
+        self.notification = None;
+    }
+
+    /// True if `(x, y)` is inside the plot rect.
+    fn point_in_plot(&self, x: Coord, y: Coord) -> bool {
+        let r = self.plot_rect;
+        let xi = x as i32;
+        let yi = y as i32;
+        xi >= r.x as i32
+            && xi < (r.x + r.w) as i32
+            && yi >= r.y as i32
+            && yi < (r.y + r.h) as i32
+    }
+
+    /// World coords under a plot-pixel position.
+    fn plot_screen_to_world(&self, sx: Coord, sy: Coord) -> (S43, S43) {
+        plot::screen_to_world(self.plot_rect, self.plot_view, sx, sy)
+    }
+
+    fn start_plot_drag(&mut self, mode: PlotDragMode, x: Coord, y: Coord) {
+        let (anchor_world_x, anchor_world_y) = self.plot_screen_to_world(x, y);
         self.plot_drag = Some(PlotDrag {
             mode,
             start_x: x,
@@ -234,14 +284,11 @@ impl PlotypusApp {
             last_x: x,
             last_y: y,
         });
-        true
     }
 
-    /// Apply the cursor's current position to the active drag. Returns true if the view changed and a redraw is needed.
-    pub fn update_plot_drag(&mut self, x: f32, y: f32) -> bool {
-        let btn_h = self.button_height();
-        let layout = Self::compute_layout(self.width, self.height, btn_h);
-        let plot_rect = layout.plot_rect;
+    /// Apply the cursor's current position to the active drag. Returns true if the view changed.
+    fn update_plot_drag(&mut self, x: Coord, y: Coord) -> bool {
+        let r = self.plot_rect;
         let Some(drag) = self.plot_drag.as_mut() else {
             return false;
         };
@@ -250,8 +297,8 @@ impl PlotypusApp {
                 let dx = x - drag.last_x;
                 let dy = y - drag.last_y;
                 let view = self.plot_view;
-                let wpx = (view.x_max - view.x_min) / plot_rect.w;
-                let wpy = (view.y_max - view.y_min) / plot_rect.h;
+                let wpx = (view.x_max - view.x_min) / r.w.max(1);
+                let wpy = (view.y_max - view.y_min) / r.h.max(1);
                 self.plot_view.x_min -= dx * wpx;
                 self.plot_view.x_max -= dx * wpx;
                 self.plot_view.y_min += dy * wpy;
@@ -259,7 +306,11 @@ impl PlotypusApp {
                 drag.last_x = x;
                 drag.last_y = y;
             }
-            PlotDragMode::Zoom => {
+            // Zoom (Ctrl+left-drag) and Aspect (right-drag) share the same cursor-anchored
+            // independent-axis scale: horizontal motion scales the x-extent, vertical the
+            // y-extent. They differ only in trigger — Aspect is the natural "stretch x vs
+            // y" gesture, Zoom keeps the modifier path for users on a left-button-only mouse.
+            PlotDragMode::Zoom | PlotDragMode::Aspect => {
                 const SENS: f32 = 0.005;
                 let dx = x - drag.start_x;
                 let dy = y - drag.start_y;
@@ -276,552 +327,828 @@ impl PlotypusApp {
                     drag.anchor_world_y + (sv.y_max - drag.anchor_world_y) * factor_y;
             }
         }
-        self.window_dirty = true;
         true
     }
 
-    pub fn end_plot_drag(&mut self) {
-        self.plot_drag = None;
+    /// Cursor-anchored uniform zoom by `factor` (scales both x and y extents by the same
+    /// amount, keeping the world point under `(sx, sy)` fixed on screen). Used by the
+    /// scroll wheel: `factor = 31/32` per notch in, `33/32` per notch out — deliberately
+    /// asymmetric so you can creep onto an exact value rather than overshoot symmetrically.
+    fn zoom_at(&mut self, sx: Coord, sy: Coord, factor: f32) {
+        let (ax, ay) = self.plot_screen_to_world(sx, sy);
+        let v = self.plot_view;
+        self.plot_view.x_min = ax - (ax - v.x_min) * factor;
+        self.plot_view.x_max = ax + (v.x_max - ax) * factor;
+        self.plot_view.y_min = ay - (ay - v.y_min) * factor;
+        self.plot_view.y_max = ay + (v.y_max - ay) * factor;
     }
 
-    pub fn button_height(&self) -> usize {
-        (self.span / 32.0 * self.ru).ceil() as usize
-    }
-
-    /// Compute all UI rectangles from window dims and chrome bar height.
-    /// Layout top-to-bottom:
-    ///   Row 1: [formula | base]
-    ///   Row 2: [y_max] (centered, matches plot width)
-    ///   Row 3: [x_min | x_max] (left/right, flanking plot)
-    ///   Row 4: [y_min] (centered, matches plot width)
-    ///   Then: plot fills the rest.
-    pub fn compute_layout(width: u32, height: u32, button_height: usize) -> Layout {
-        let w = width as usize;
-        let h = height as usize;
-        let margin = button_height;
-        let gap = (button_height / 4).max(2);
-        let input_h = button_height;
-
-        // Row 1: formula + base
-        let row1_y = button_height + gap;
-        let total_w = w.saturating_sub(margin * 2);
-        let base_w = input_h * 2;
-        let formula_w = total_w.saturating_sub(gap + base_w);
-
-        // Row 2: y_max (full width)
-        let row2_y = row1_y + input_h + gap;
-
-        // Row 3: x_min (left half) | x_max (right half)
-        let row3_y = row2_y + input_h + gap;
-        let half_w = total_w.saturating_sub(gap) / 2;
-
-        // Row 4: y_min (full width)
-        let row4_y = row3_y + input_h + gap;
-
-        // Plot
-        let plot_y = row4_y + input_h + gap;
-        let plot_h = h.saturating_sub(plot_y + margin);
-
-        Layout {
-            formula_rect: Rect { x: margin, y: row1_y, w: formula_w, h: input_h },
-            base_rect: Rect { x: margin + formula_w + gap, y: row1_y, w: base_w, h: input_h },
-            range_rects: [
-                // 0: x_min — row 3 left
-                Rect { x: margin, y: row3_y, w: half_w, h: input_h },
-                // 1: x_max — row 3 right
-                Rect { x: margin + half_w + gap, y: row3_y, w: half_w, h: input_h },
-                // 2: y_min — row 4 full width
-                Rect { x: margin, y: row4_y, w: total_w, h: input_h },
-                // 3: y_max — row 2 full width
-                Rect { x: margin, y: row2_y, w: total_w, h: input_h },
-            ],
-            plot_rect: Rect { x: margin, y: plot_y, w: total_w, h: plot_h },
+    /// Synthesize a Photon notification, frame the plot to its waveform, and play it.
+    /// The plot updates even if audio fails so the waveform is still visible.
+    fn play_notification(&mut self, seed: u64) {
+        let voice = PhotonVoice::from_seed(seed);
+        self.plot_view = PlotView {
+            x_min: S43::ZERO,
+            x_max: S43::from(synth::DURATION_SECS),
+            y_min: S43::from(-1.05f32),
+            y_max: S43::from(1.05f32),
+        };
+        self.notification = Some(voice);
+        let samples = voice.render();
+        if let Err(e) = crate::audio::play(samples) {
+            crate::log(&format!("notification playback failed: {e}"));
         }
     }
 
-    pub fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
+    /// Commit the typed formula: re-parse it (updating the plotted curve) and, if it
+    /// parses, play it as audio — `x` sweeps the visible plot x-range over the duration
+    /// set in the duration box, `y = f(x)` is the waveform. This is the Enter /
+    /// play-button action: "evaluate and hear what I typed." Leaves notification mode.
+    fn play_formula(&mut self) {
+        self.reparse_formula();
+        let Some(Ok(tokens)) = &self.formula else {
+            return; // empty box or parse error — nothing to play
+        };
+        let tokens = tokens.clone();
+        let x_min = self.plot_view.x_min.to_f32();
+        let x_max = self.plot_view.x_max.to_f32();
+        let y_min = self.plot_view.y_min.to_f32();
+        let y_max = self.plot_view.y_max.to_f32();
+        let duration = self.play_duration();
+        // Map y through the visible y-range to audio full-scale, 1:1 — the vertical axis
+        // IS the volume, so a curve that runs off the top/bottom clips and distorts.
+        let samples = synth::render_formula(
+            |x: S43| formula::evaluate(&tokens, x).unwrap_or(S43::ZERO),
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            duration,
+        );
+        if let Err(e) = crate::audio::play(samples) {
+            crate::log(&format!("formula playback failed: {e}"));
+        }
+    }
+
+    /// Parse the duration box as plain decimal seconds. Falls back to the default on an
+    /// unparseable or non-positive value, and clamps to a sane range so a fat-fingered
+    /// "1000" doesn't queue a 16-minute buffer.
+    fn play_duration(&self) -> f32 {
+        let text: String = self.duration_box.chars.iter().collect();
+        text.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(synth::DURATION_SECS)
+            .clamp(0.05, 30.0)
+    }
+
+    /// Borrow whichever textbox currently holds focus, or `None` if focus is on a
+    /// non-textbox widget (or nothing).
+    fn focused_textbox_mut(&mut self) -> Option<&mut Textbox> {
+        let focus = self.current_focus?;
+        if focus == self.formula_box.hit_id() {
+            Some(&mut self.formula_box)
+        } else if focus == self.duration_box.hit_id() {
+            Some(&mut self.duration_box)
+        } else {
+            None
+        }
+    }
+
+    fn change_focus(&mut self, new_focus: Option<HitId>, ctx: &mut Context) {
+        if new_focus == self.current_focus {
             return;
         }
-        self.width = size.width;
-        self.height = size.height;
-        self.span = compute_span(size.width, size.height);
-        self.renderer.resize(size.width, size.height);
-        let n = (size.width * size.height) as usize;
-        self.hit_test_map.resize(n, compositing::HIT_BODY);
-        self.textbox_mask.resize(n, 0);
-        self.window_dirty = true;
-        self.last_layout = None;
-        self.blinkey_visible = false;
-    }
-
-    pub fn set_fullscreen(&mut self, fullscreen: bool) {
-        if self.is_fullscreen != fullscreen {
-            self.is_fullscreen = fullscreen;
-            self.window_dirty = true;
-        }
-    }
-
-    /// Hit-test a pixel position. Returns `HIT_NONE` for non-finite coords (e.g. the `f32::NAN` sentinel before the first cursor event) and for any position outside the window.
-    pub fn hit_test(&self, x: f32, y: f32) -> u8 {
-        if !x.is_finite() || !y.is_finite() {
-            return compositing::HIT_NONE;
-        }
-        let xi = x as i32;
-        let yi = y as i32;
-        if xi < 0 || yi < 0 || (xi as u32) >= self.width || (yi as u32) >= self.height {
-            return compositing::HIT_NONE;
-        }
-        let idx = yi as usize * self.width as usize + xi as usize;
-        self.hit_test_map[idx]
-    }
-
-    /// Detect resize edge proximity. Returns ResizeEdge::None outside the threshold.
-    pub fn get_resize_edge(&self, x: f32, y: f32) -> ResizeEdge {
-        if self.is_fullscreen {
-            return ResizeEdge::None;
-        }
-        let border = (self.span / 32.0).ceil();
-        let at_left = x < border;
-        let at_right = x > (self.width as f32 - border);
-        let at_top = y < border;
-        let at_bottom = y > (self.height as f32 - border);
-
-        if at_top && at_left {
-            ResizeEdge::TopLeft
-        } else if at_top && at_right {
-            ResizeEdge::TopRight
-        } else if at_bottom && at_left {
-            ResizeEdge::BottomLeft
-        } else if at_bottom && at_right {
-            ResizeEdge::BottomRight
-        } else if at_top {
-            ResizeEdge::Top
-        } else if at_bottom {
-            ResizeEdge::Bottom
-        } else if at_left {
-            ResizeEdge::Left
-        } else if at_right {
-            ResizeEdge::Right
+        let prior = self.current_focus;
+        widget::apply_focus_change(self as &mut dyn Container, prior, new_focus);
+        self.current_focus = new_focus;
+        if new_focus.is_some() {
+            self.blink.start(Instant::now());
         } else {
-            ResizeEdge::None
+            self.blink.stop();
         }
+        ctx.window.request_redraw();
+    }
+}
+
+impl Container for PlotypusApp {
+    fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
+        f(&mut self.formula_box);
+        f(&mut self.duration_box);
+        f(&mut self.play_button);
+        self.chrome.visit(f);
+    }
+}
+
+impl FluorApp for PlotypusApp {
+    type UserEvent = ();
+
+    fn title(&self) -> &str {
+        &self.title
     }
 
-    /// Adjust ru zoom by `steps` in 33/32-per-step increments (Photon's pattern).
-    pub fn adjust_zoom(&mut self, steps: f32) {
-        let factor = if steps.is_sign_negative() {
-            (33f32 / 32.0).powf(steps)
-        } else {
-            (31f32 / 32.0).powf(-steps)
-        };
-        self.ru = (self.ru * factor).clamp(0.125, 4.0);
-        self.window_dirty = true;
+    fn window_icon(&self) -> Option<&fluor::host::icon::Icon> {
+        // Same orb the chrome paints in its top-left slot, so the OS taskbar / alt-tab icon
+        // matches the in-window orb (on the platforms winit honours — Windows + X11).
+        self.chrome.app_icon.as_ref()
     }
 
-    /// Populate debug_hit_colours with a deterministic-enough random palette indexed by element id.
-    pub fn regenerate_debug_hit_colours(&mut self) {
-        let mut rng = rand::thread_rng();
-        self.debug_hit_colours.clear();
-        for _ in 0..=255u8 {
-            self.debug_hit_colours
-                .push((rng.r#gen(), rng.r#gen(), rng.r#gen()));
-        }
+    fn init(&mut self, ctx: &mut Context) {
+        self.chrome.resize(ctx.viewport);
+        self.update_layout(ctx);
+        self.reparse_formula();
     }
 
-    /// Three-flag gate: whether this frame needs a full-screen redraw.
-    /// Mirrors Photon's `window_dirty || debug_hit_test || show_textbox_mask` pattern. Buffer-guard mark methods are no-ops — real dirty tracking lives on `self.renderer`.
-    fn needs_full_redraw(&self) -> bool {
-        self.window_dirty || self.debug_hit_test || self.show_textbox_mask
+    fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
+        self.chrome.resize(ctx.viewport);
+        self.is_maximized = ctx.is_maximized;
+        self.chrome.set_full_edge(ctx.is_maximized);
+        self.update_layout(ctx);
     }
 
-    pub fn render(&mut self) {
-        self.frame_counter += 1;
-
-        // Re-parse the formula whenever the input text has changed (or on the very first render). The curve closure passed to `draw_plot` reads from `self.formula`, so the parse must happen before we hit the redraw paths. A new parse forces a full redraw — the differential text path doesn't redraw the plot, but the curve depends on the formula.
-        if self.text_dirty || self.formula.is_none() {
-            let text: String = self.text_state.chars.iter().collect();
-            // Empty box = resting state (formula = None); only call parser on non-empty input so empty box keeps grid + labels visible.
-            self.formula = if text.trim().is_empty() {
-                None
-            } else {
-                Some(formula::parse(&text, self.base))
-            };
-            self.window_dirty = true;
-        }
-
-        if !self.needs_full_redraw() {
-            if self.text_dirty {
-                self.render_input_diff();
+    fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
+        match event {
+            Event::ModifiersChanged(m) => {
+                self.modifiers = *m;
+                EventResponse::Pass
             }
-            return;
-        }
 
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let speckle = (self.frame_counter % 1024) as usize;
-        let fullscreen = self.is_fullscreen;
-        let ru = self.ru;
-        let hovered = self.hovered_button;
-        let debug = self.debug;
-        let debug_hit_test = self.debug_hit_test;
-        let frame = self.frame_counter;
+            Event::CursorMoved { .. } => {
+                // Use ctx.cursor_x/y (window-local) NOT the event's x/y. In Fluor's
+                // fullscreen-compositor model the CursorMoved event carries raw SCREEN
+                // coords, while ctx and every other geometry value is window-local — mixing
+                // them makes the first pan delta jump by the window's screen offset.
+                let x = ctx.cursor_x;
+                let y = ctx.cursor_y;
+                if self.plot_drag.is_some() {
+                    if self.update_plot_drag(x, y) {
+                        ctx.window.request_redraw();
+                    }
+                    return EventResponse::Handled;
+                }
+                // Drag-select: extend the focused textbox's selection to the cursor. The
+                // anchor is set on the first move (so a click-drag selects from the press
+                // caret), and `cursor` tracks the pixel under the mouse each frame.
+                if self.is_dragging_select {
+                    if let Some(tb) = self.focused_textbox_mut() {
+                        let cx = x.clamp(tb.text_left(), tb.text_right());
+                        if tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        }
+                        tb.cursor = tb.cursor_index_from_x(cx);
+                    }
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+                // Hover bookkeeping for chrome + widgets.
+                let new_hit = self.chrome.hit_at(x, y);
+                let mut changed = self.chrome.set_hover(new_hit);
+                let want_tb = new_hit == self.formula_box.hit_id();
+                if self.formula_box.is_hovered() != want_tb {
+                    self.formula_box.set_hovered(want_tb);
+                    changed = true;
+                }
+                let want_dur = new_hit == self.duration_box.hit_id();
+                if self.duration_box.is_hovered() != want_dur {
+                    self.duration_box.set_hovered(want_dur);
+                    changed = true;
+                }
+                let want_btn = new_hit == self.play_button.hit_id();
+                if self.play_button.is_hovered() != want_btn {
+                    self.play_button.set_hovered(want_btn);
+                    changed = true;
+                }
+                if changed {
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
 
-        for h in self.hit_test_map.iter_mut() {
-            *h = compositing::HIT_BODY;
-        }
+            Event::CursorLeft => {
+                if self.chrome.set_hover(HIT_NONE) {
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
 
-        // Pre-mark the renderer dirty BEFORE locking the buffer. The SoftbufferBuffer guard's mark_* methods are no-ops; only Renderer::mark_* updates the dirty_y_min/max range that present_frame uses to copy rows.
-        self.renderer.mark_all();
+            Event::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+            } => {
+                let x = ctx.cursor_x;
+                let y = ctx.cursor_y;
+                let hit_id = self.chrome.hit_at(x, y);
 
-        let mut buffer = self.renderer.lock_buffer();
-        let pixels: &mut [u32] = &mut buffer;
+                // Widget hit takes precedence over resize edges + plot.
+                if hit_id != HIT_NONE {
+                    let mods = self.modifiers;
+                    let response = widget::dispatch_click(self as &mut dyn Container, hit_id, x, y, mods);
+                    // Focus the widget if it's focusable.
+                    let mut focusable = false;
+                    self.visit(&mut |w| {
+                        if w.id() == hit_id && w.focus().is_some() {
+                            focusable = true;
+                        }
+                    });
+                    self.change_focus(if focusable { Some(hit_id) } else { None }, ctx);
+                    // `dispatch_click` above already set the caret (Textbox::on_click);
+                    // arm drag-select so a press-and-drag extends a selection.
+                    if self.focused_textbox_mut().is_some() {
+                        self.is_dragging_select = true;
+                    }
+                    ctx.window.request_redraw();
+                    return response;
+                }
 
-        drawing::draw_background_texture(pixels, width, height, speckle, fullscreen, 0);
+                // Plot: plain drag = pan, zoom-modifier drag = zoom.
+                if self.point_in_plot(x, y) {
+                    self.change_focus(None, ctx);
+                    let mode = if self.modifiers.control_key() || self.modifiers.super_key() {
+                        PlotDragMode::Zoom
+                    } else {
+                        PlotDragMode::Pan
+                    };
+                    self.start_plot_drag(mode, x, y);
+                    return EventResponse::Handled;
+                }
 
-        let (start, crossings, btn_x, btn_h) =
-            Self::draw_window_controls(pixels, &mut self.hit_test_map, self.width, self.height, ru);
-
-        if !fullscreen {
-            Self::draw_window_edges_and_mask(
-                pixels,
-                &mut self.hit_test_map,
-                self.width,
-                self.height,
-                start,
-                &crossings,
-            );
-        }
-
-        // Hairlines between min|max and max|close, walked from centre until each hits the squircle. Must come after edges_and_mask so the colour-change detection terminates at the right pixel.
-        Self::draw_button_hairlines(pixels, &mut self.hit_test_map, self.width, btn_x, btn_h);
-
-        // Hover tint: scan hit_test_map for the hovered button's id and wrapping_add the theme delta to every matching pixel. Photon's pattern.
-        let (hover_id, hover_delta) = match hovered {
-            HoveredButton::Close => (HIT_CLOSE_BUTTON, theme::CLOSE_HOVER),
-            HoveredButton::Maximize => (HIT_MAXIMIZE_BUTTON, theme::MAXIMIZE_HOVER),
-            HoveredButton::Minimize => (HIT_MINIMIZE_BUTTON, theme::MINIMIZE_HOVER),
-            _ => (compositing::HIT_NONE, 0),
-        };
-        Self::apply_window_control_hover(pixels, &self.hit_test_map, hover_id, hover_delta);
-        let _ = btn_x;
-
-        let layout = Self::compute_layout(self.width, self.height, btn_h);
-        let input_rect = layout.formula_rect;
-        let plot_rect = layout.plot_rect;
-        if plot_rect.w > 4 && plot_rect.h > 4 {
-            let label_font_size = (btn_h as f32 * 0.5).max(10.0);
-            let formula = self
-                .formula
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .map(|v| v.as_slice());
-            // Empty input is filtered upstream (formula stays `None`), so any `Some(Err(_))` here is a real parse error and we blank the plot region as a visual "your formula is broken" signal.
-            let parse_failed = matches!(&self.formula, Some(Err(_)));
-            draw_plot(
-                pixels,
-                &mut self.hit_test_map,
-                &mut self.text_renderer,
-                width,
-                plot_rect,
-                self.plot_view,
-                label_font_size,
-                formula,
-                parse_failed,
-                self.base,
-            );
-        }
-
-        // Sync focused state from focused_box enum
-        self.text_state.focused = self.focused_box == FocusedBox::Formula;
-
-        // Input box: draw chrome (bg + frame + prompt), then additively render text and blinkey. Snapshot text_state + layout + blinkey position so the diff path can subtract them on the next text-only update.
-        if input_rect.w > 4 && input_rect.h > 4 {
-            let font_size = (input_rect.h as f32 * 0.55).max(12.0);
-            let prompt_w = input_box::measure_prompt_width(&mut self.text_renderer, font_size);
-            let input_layout = InputLayout::new(input_rect, prompt_w, font_size);
-
-            // Re-measure widths in case the font size changed (resize, ru change).
-            recompute_widths(&mut self.text_state, &mut self.text_renderer, font_size);
-
-            draw_chrome(
-                pixels,
-                &mut self.hit_test_map,
-                &mut self.textbox_mask,
-                width,
-                input_rect,
-                self.text_state.focused,
-                &input_layout,
-                &mut self.text_renderer,
-            );
-
-            render_text(
-                pixels,
-                &mut self.text_renderer,
-                width,
-                &self.text_state,
-                &input_layout,
-                &self.textbox_mask,
-                true,
-            );
-
-            let blinkey_visible = self.text_state.focused;
-            if blinkey_visible {
-                self.blinkey_top_bright = rand::thread_rng().r#gen();
-                let bx = input_layout.cursor_x(&self.text_state);
-                render_blinkey(
-                    pixels,
-                    width,
-                    bx,
-                    input_layout.blinkey_top,
-                    input_layout.blinkey_height,
-                    self.blinkey_top_bright,
-                    true,
+                // Resize edge, else window drag.
+                let edge = chrome::get_resize_edge(
+                    ctx.viewport.width_px,
+                    ctx.viewport.height_px,
+                    x,
+                    y,
                 );
-                self.last_blinkey_x = bx;
-                self.last_blinkey_top = input_layout.blinkey_top;
-                self.last_blinkey_height = input_layout.blinkey_height;
-                self.next_blink_time = next_blink_wake();
+                if edge != ResizeEdge::None {
+                    return EventResponse::StartResize(edge);
+                }
+                self.change_focus(None, ctx);
+                EventResponse::StartWindowDrag
             }
-            self.blinkey_visible = blinkey_visible;
 
-            self.last_text_state = self.text_state.clone();
-            self.last_layout = Some(input_layout);
-            self.text_dirty = false;
-        }
-
-        // Base box
-        let base_rect = layout.base_rect;
-        if base_rect.w > 2 && base_rect.h > 2 {
-            let base_focused = self.focused_box == FocusedBox::Base;
-            draw_value_chrome(
-                pixels, &mut self.hit_test_map, &mut self.textbox_mask,
-                width, base_rect, base_focused, HIT_BASE_BOX,
-            );
-            let base_font_size = (base_rect.h as f32 * 0.55).max(12.0);
-            let base_ch = formula::base_to_char(self.base);
-            let base_str = format!("{}", base_ch);
-            render_value_text(
-                pixels, &mut self.text_renderer, width,
-                &base_str, base_rect, base_font_size,
-            );
-        }
-
-        // Range boxes: sync text from plot_view when not focused, then draw
-        let range_hit_ids = [HIT_RANGE_XMIN, HIT_RANGE_XMAX, HIT_RANGE_YMIN, HIT_RANGE_YMAX];
-        let range_focused_variants = [
-            FocusedBox::RangeXMin, FocusedBox::RangeXMax,
-            FocusedBox::RangeYMin, FocusedBox::RangeYMax,
-        ];
-        let range_values = [
-            self.plot_view.x_min, self.plot_view.x_max,
-            self.plot_view.y_min, self.plot_view.y_max,
-        ];
-        let base = self.base;
-        for i in 0..4 {
-            let r = layout.range_rects[i];
-            if r.w < 4 || r.h < 4 { continue; }
-            let focused = self.focused_box == range_focused_variants[i];
-            // When not focused, populate from live plot_view
-            if !focused {
-                let formatted = format!("{:4.base$}", range_values[i], base = base as usize);
-                self.range_text_states[i].chars = formatted.chars().collect();
-                self.range_text_states[i].widths = vec![0; self.range_text_states[i].chars.len()];
-                self.range_text_states[i].blinkey_index = self.range_text_states[i].chars.len();
+            // Right-button press in the plot starts an aspect (x/y) drag.
+            Event::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+            } => {
+                let x = ctx.cursor_x;
+                let y = ctx.cursor_y;
+                if self.point_in_plot(x, y) {
+                    self.start_plot_drag(PlotDragMode::Aspect, x, y);
+                    return EventResponse::Handled;
+                }
+                EventResponse::Pass
             }
-            self.range_text_states[i].focused = focused;
-            draw_value_chrome(
-                pixels, &mut self.hit_test_map, &mut self.textbox_mask,
-                width, r, focused, range_hit_ids[i],
-            );
-            if focused {
-                // Draw editable text with blinkey
-                let font_size = (r.h as f32 * 0.55).max(12.0);
-                let il = InputLayout::new(r, 0.0, font_size);
-                recompute_widths(&mut self.range_text_states[i], &mut self.text_renderer, font_size);
-                render_text(
-                    pixels, &mut self.text_renderer, width,
-                    &self.range_text_states[i], &il, &self.textbox_mask, true,
+
+            // Any button release ends an active plot drag or selection drag.
+            Event::MouseInput {
+                state: ElementState::Released,
+                ..
+            } => {
+                let mut handled = self.plot_drag.take().is_some();
+                if self.is_dragging_select {
+                    self.is_dragging_select = false;
+                    // A zero-width selection (click without drag) collapses to a caret.
+                    if let Some(tb) = self.focused_textbox_mut() {
+                        if tb.selection_anchor == Some(tb.cursor) {
+                            tb.selection_anchor = None;
+                        }
+                    }
+                    handled = true;
+                }
+                if handled {
+                    return EventResponse::Handled;
+                }
+                EventResponse::Pass
+            }
+
+            // Scroll wheel: cursor-anchored zoom. Up = in (31/32), down = out (33/32) —
+            // asymmetric so repeated notches can weasel onto an exact value.
+            Event::MouseWheel { delta } => {
+                let x = ctx.cursor_x;
+                let y = ctx.cursor_y;
+                if !self.point_in_plot(x, y) {
+                    return EventResponse::Pass;
+                }
+                let steps: f32 = match delta {
+                    fluor::event::MouseScrollDelta::Lines(_, y) => *y,
+                    fluor::event::MouseScrollDelta::Pixels(_, y) => y / 32.0,
+                };
+                if steps == 0.0 {
+                    return EventResponse::Pass;
+                }
+                // Per-notch factor, raised to |steps| so trackpad fractional deltas scale
+                // smoothly. steps > 0 (scroll up) zooms in (31/32 < 1 shrinks the view).
+                let per_notch: f32 = if steps > 0.0 { 31.0 / 32.0 } else { 33.0 / 32.0 };
+                let factor = per_notch.powf(steps.abs());
+                self.zoom_at(x, y, factor);
+                ctx.window.request_redraw();
+                EventResponse::Handled
+            }
+
+            Event::KeyboardInput { event: kev } => self.handle_key(kev, ctx),
+
+            Event::Focused(focused) => {
+                if self.chrome.set_focused(*focused) {
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
+
+            _ => EventResponse::Pass,
+        }
+    }
+
+    fn damage_rect(&self, viewport: Viewport) -> Option<PixelRect> {
+        // Conservative first cut: full viewport every frame. Matches the pre-migration
+        // full-redraw behaviour; differential damage is a later optimization.
+        let w = viewport.width_px as usize;
+        let h = viewport.height_px as usize;
+        Some(PixelRect::new(0, 0, w, h))
+    }
+
+    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
+        let (w, h) = self.chrome.dims();
+        Some((self.chrome.hit_test_map(), w, h))
+    }
+
+    fn overlay_deltas(&mut self) -> Vec<u32> {
+        let count = self.hit_counter as usize + 1;
+        widget::build_overlay_deltas(self, count)
+    }
+
+    fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
+        let buf_w = ctx.viewport.width_px as usize;
+        let buf_h = ctx.viewport.height_px as usize;
+
+        // Chrome background + perimeter + controls. The bg closure must fully cover the
+        // window-shaped background; we paint a night-sky starfield (see `draw_starfield`)
+        // — on-theme for the Photon notification (each star is a little signal), fully
+        // deterministic, single-pass, no per-frame animation cost.
+        self.chrome.rasterize_bg(ctx.damage, |canvas| draw_starfield(canvas));
+        self.chrome
+            .rasterize_perimeter(target, buf_w, buf_h, ctx.clip_mask);
+        self.chrome
+            .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
+
+        // Plot region — straight into the present buffer. Notification mode plots the
+        // synth's S43 voice(t); otherwise the parsed formula curve.
+        let label_font_size = (ctx.viewport.effective_span() / 64.0).max(10.0);
+        if self.plot_rect.w > 4 && self.plot_rect.h > 4 {
+            if let Some(voice) = self.notification {
+                plot::draw_plot_curve(
+                    target,
+                    ctx.text,
+                    ctx.damage,
+                    buf_w,
+                    buf_h,
+                    self.plot_rect,
+                    self.plot_view,
+                    label_font_size,
+                    |x: S43| voice.voice(x.to_f32()),
                 );
-                let bx = il.cursor_x(&self.range_text_states[i]);
-                render_blinkey(pixels, width, bx, il.blinkey_top, il.blinkey_height, true, true);
             } else {
-                let font_size = (r.h as f32 * 0.45).max(10.0);
-                let text: String = self.range_text_states[i].chars.iter().collect();
-                render_value_text(pixels, &mut self.text_renderer, width, &text, r, font_size);
+                let formula = self
+                    .formula
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|v| v.as_slice());
+                let parse_failed = matches!(&self.formula, Some(Err(_)));
+                plot::draw_plot(
+                    target,
+                    ctx.text,
+                    ctx.damage,
+                    buf_w,
+                    buf_h,
+                    self.plot_rect,
+                    self.plot_view,
+                    label_font_size,
+                    formula,
+                    parse_failed,
+                );
             }
         }
 
-        if debug {
-            let dbg = format!(
-                "frame={}  ru={:.3}  size={}x{}  hov={:?}  edge={:?}",
-                frame, ru, width, height, hovered, self.resize_edge
+        // Widgets paint on top, stamping their hit ids into the chrome's hit map.
+        {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let id = self.formula_box.hit_id();
+            self.formula_box.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                id,
             );
-            self.text_renderer.draw_text_left_u32(
-                pixels,
-                width,
-                &dbg,
-                12.0,
-                height as f32 - 28.0,
-                14.0,
-                400,
-                theme::COUNTER_TEXT,
-                theme::FONT_UI,
+            let did = self.duration_box.hit_id();
+            self.duration_box.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                did,
+            );
+            let bid = self.play_button.hit_id();
+            self.play_button.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                bid,
             );
         }
 
-        if debug_hit_test && !self.debug_hit_colours.is_empty() {
-            for y in 0..height {
-                for x in 0..width {
-                    let idx = y * width + x;
-                    let id = self.hit_test_map[idx] as usize;
-                    if id < self.debug_hit_colours.len() {
-                        let (r, g, b) = self.debug_hit_colours[id];
-                        pixels[idx] = compositing::pack_argb(r, g, b, 255);
+        self.chrome.flatten_into(target, buf_w, buf_h, None);
+
+        // Blinkey for whichever textbox is focused, painted on top.
+        if self.current_focus == Some(self.formula_box.hit_id()) {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            self.formula_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
+        } else if self.current_focus == Some(self.duration_box.hit_id()) {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            self.duration_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
+        }
+
+        // Debug hit-map overlay (`[]h`): replace every pixel with its hit-id's flat colour
+        // so interactive zones are unmistakable. Drawn last, over everything.
+        if self.show_hitmask && !self.debug_hit_colours.is_empty() {
+            let map = &self.chrome.hit_test_map;
+            let n = map.len().min(target.len());
+            for i in 0..n {
+                target[i] = self
+                    .debug_hit_colours
+                    .get(map[i] as usize)
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+
+        // Debug-chord hint panel — visible while both `[` and `]` are held.
+        if self.chord.both_held(Instant::now()) {
+            let span = ctx.viewport.effective_span();
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            fluor::paint::draw_chord_hint(&mut canvas, ctx.text, DEBUG_CHORDS, span);
+        }
+    }
+
+    fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
+        let hit = self.chrome.hit_at(x, y);
+        if self.chrome.owns_hit(hit) {
+            return CursorIcon::Pointer;
+        }
+        if hit == self.play_button.hit_id() {
+            return CursorIcon::Pointer;
+        }
+        if hit == self.formula_box.hit_id() || hit == self.duration_box.hit_id() {
+            return CursorIcon::Text;
+        }
+        match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
+            ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
+            ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
+            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
+            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
+            ResizeEdge::None => {
+                if self.point_in_plot(x, y) {
+                    CursorIcon::Default
+                } else {
+                    CursorIcon::Default
+                }
+            }
+        }
+    }
+
+    fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
+        // Match pre-migration launch geometry: 3/4 of the smaller screen dimension tall,
+        // 5:4 landscape. Gives the plot a comfortable aspect on first open.
+        let win_h = monitor.0.min(monitor.1) * 3 / 4;
+        let win_w = win_h * 5 / 4;
+        (win_w.max(1), win_h.max(1))
+    }
+
+    fn wake_at(&self) -> Option<Instant> {
+        self.blink.next_tick()
+    }
+
+    fn tick(&mut self, _ctx: &mut Context) -> bool {
+        let mut needs_redraw = false;
+        if self.blink.poll(Instant::now()) {
+            // flip_blinkey is a no-op on an unfocused box, so flipping both is safe and
+            // covers whichever currently holds focus.
+            let a = self.formula_box.flip_blinkey();
+            let b = self.duration_box.flip_blinkey();
+            if a || b {
+                needs_redraw = true;
+            }
+        }
+        // Play button → evaluate + play the typed formula (same as Enter).
+        if self.play_button.take_click() {
+            self.play_formula();
+            needs_redraw = true;
+        }
+        needs_redraw
+    }
+}
+
+impl PlotypusApp {
+    /// Keyboard handling: Tab/Esc focus control, Enter/Ctrl+P play, else deliver to the
+    /// focused widget and re-parse on textbox edits.
+    fn handle_key(&mut self, kev: &KeyEvent, ctx: &mut Context) -> EventResponse {
+        // --- Debug chord: hold `[` AND `]`, then press an action key. Bracket tracking
+        // must run on BOTH press and release (before the key-down early-return) so the
+        // held-state is current. Brackets still type into the focused box as normal.
+        if let Key::Character(c) = &kev.logical_key {
+            let now = Instant::now();
+            let s = c.as_str();
+            if s == "[" || s == "]" {
+                self.chord.note(s.chars().next().unwrap(), kev.state, now);
+                ctx.window.request_redraw();
+            } else if kev.state == ElementState::Pressed
+                && !kev.repeat
+                && self.chord.both_held(now)
+            {
+                if let Some(ac) = c.to_ascii_lowercase().chars().next() {
+                    if self.handle_debug_chord(ac, ctx) {
+                        return EventResponse::Handled;
                     }
                 }
             }
         }
 
-        let _ = buffer.present();
-        self.window_dirty = false;
+        if kev.state != ElementState::Pressed {
+            return EventResponse::Pass;
+        }
+        let shift = self.modifiers.shift_key();
+        let zoom_mod = self.modifiers.control_key() || self.modifiers.super_key();
+
+        // Tab / Shift+Tab focus cycle.
+        if matches!(kev.logical_key, Key::Named(NamedKey::Tab)) {
+            let dir = if shift { TabDir::Backward } else { TabDir::Forward };
+            let current = self.current_focus;
+            let next = widget::linear_tab_next(self as &mut dyn Container, current, dir);
+            self.change_focus(next, ctx);
+            return EventResponse::Handled;
+        }
+        // Escape clears focus.
+        if matches!(kev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.change_focus(None, ctx);
+            return EventResponse::Handled;
+        }
+        // Ctrl/Cmd+P → play the Photon notification (the deterministic demo sound).
+        if zoom_mod {
+            if let Key::Character(c) = &kev.logical_key {
+                if c.eq_ignore_ascii_case("p") {
+                    self.notification_seed = self.notification_seed.wrapping_add(0x9E37_79B9);
+                    let seed = self.notification_seed;
+                    self.play_notification(seed);
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+            }
+        }
+        // Enter → commit the typed formula: evaluate, replot, and play it as audio.
+        if matches!(kev.logical_key, Key::Named(NamedKey::Enter)) {
+            self.play_formula();
+            ctx.window.request_redraw();
+            return EventResponse::Handled;
+        }
+
+        // Deliver to the focused widget. Edits update the box's text but the plot does
+        // NOT re-render until Enter (plot-on-commit, not live) — so half-typed
+        // expressions don't flash broken curves.
+        let Some(focus_id) = self.current_focus else {
+            return EventResponse::Pass;
+        };
+        let mods = self.modifiers;
+        let text = &mut *ctx.text;
+        let response = widget::dispatch_key(self as &mut dyn Container, focus_id, kev, mods, text);
+
+        if matches!(response, EventResponse::Handled)
+            && (focus_id == self.formula_box.hit_id() || focus_id == self.duration_box.hit_id())
+        {
+            // Keep the cursor solid + blink-restarted while actively typing.
+            self.blink.start(Instant::now());
+            ctx.window.request_redraw();
+        }
+        response
     }
 
-    /// Differential input box render: subtract last frame's text+blinkey from `cpu_buffer`, then add the current ones. Marks only the input rect's rows dirty so the chrome and plot stay untouched in the compositor.
-    fn render_input_diff(&mut self) {
-        let Some(layout) = self.last_layout else {
-            // No previous full draw to diff against — escalate.
-            self.window_dirty = true;
-            return;
+    /// Apply a `[]`+key debug toggle. Returns true if the key was a known debug action.
+    /// Most toggles just flip a Fluor atomic that its finalize / host already honors;
+    /// the hitmask is the one Plotypus paints itself (see `render`). Debug chords are
+    /// listed in `DEBUG_CHORDS` for the on-screen hint.
+    fn handle_debug_chord(&mut self, ac: char, ctx: &mut Context) -> bool {
+        use fluor::paint as fp;
+        use std::sync::atomic::Ordering::Relaxed;
+        let flip = |a: &std::sync::atomic::AtomicBool| {
+            let v = !a.load(Relaxed);
+            a.store(v, Relaxed);
+            v
         };
-        let width = self.width as usize;
-        let rect = layout.rect;
-
-        self.renderer
-            .mark_rows(rect.y as u32, (rect.y + rect.h) as u32);
-
-        let mut buffer = self.renderer.lock_buffer();
-        let pixels: &mut [u32] = &mut buffer;
-
-        if self.blinkey_visible {
-            render_blinkey(
-                pixels,
-                width,
-                self.last_blinkey_x,
-                self.last_blinkey_top,
-                self.last_blinkey_height,
-                self.blinkey_top_bright,
-                false,
-            );
-            self.blinkey_visible = false;
+        match ac {
+            'h' => {
+                self.show_hitmask = !self.show_hitmask;
+                fp::DEBUG_SHOW_HITMASK.store(self.show_hitmask, Relaxed);
+                if self.show_hitmask {
+                    self.regen_debug_hit_colours();
+                }
+            }
+            'a' => {
+                // Cycle off → grayscale → force-opaque → off.
+                let next = (fp::DEBUG_SHOW_ALPHA.load(Relaxed) + 1) % 3;
+                fp::DEBUG_SHOW_ALPHA.store(next, Relaxed);
+            }
+            'p' => {
+                flip(&fp::DEBUG_SKIP_PREMULT);
+            }
+            'c' => {
+                flip(&fp::DEBUG_SKIP_CHROME);
+                self.chrome.invalidate_chrome();
+            }
+            'l' => {
+                flip(&fp::DEBUG_SKIP_CONTROLS);
+                self.chrome.invalidate_chrome();
+            }
+            'f' => {
+                flip(&fp::DEBUG_SHOW_FPS);
+            }
+            'w' => {
+                flip(&fp::DEBUG_SHOW_DAMAGE);
+            }
+            'd' => {
+                flip(&fp::DEBUG_SHOW_FADE);
+            }
+            'b' => {
+                flip(&fp::DEBUG_SHOW_OPAQUE_SCAN);
+            }
+            _ => return false,
         }
-
-        render_text(
-            pixels,
-            &mut self.text_renderer,
-            width,
-            &self.last_text_state,
-            &layout,
-            &self.textbox_mask,
-            false,
-        );
-
-        render_text(
-            pixels,
-            &mut self.text_renderer,
-            width,
-            &self.text_state,
-            &layout,
-            &self.textbox_mask,
-            true,
-        );
-
-        if self.text_state.focused {
-            self.blinkey_top_bright = rand::thread_rng().r#gen();
-            let bx = layout.cursor_x(&self.text_state);
-            render_blinkey(
-                pixels,
-                width,
-                bx,
-                layout.blinkey_top,
-                layout.blinkey_height,
-                self.blinkey_top_bright,
-                true,
-            );
-            self.last_blinkey_x = bx;
-            self.last_blinkey_top = layout.blinkey_top;
-            self.last_blinkey_height = layout.blinkey_height;
-            self.blinkey_visible = true;
-            self.next_blink_time = next_blink_wake();
-        }
-
-        let _ = buffer.present();
-
-        self.last_text_state = self.text_state.clone();
-        self.text_dirty = false;
+        ctx.window.request_redraw();
+        true
     }
 
-    /// Toggle the blinkey on or off in `cpu_buffer`, schedule the next toggle. Called from the event loop when `next_blink_time` is reached.
-    pub fn flip_blinkey(&mut self) {
-        if !self.text_state.focused {
-            return;
-        }
-        let Some(layout) = self.last_layout else {
-            return;
+    /// Fill `debug_hit_colours` with 256 distinct opaque colours (darkness convention) so
+    /// the hitmask overlay shows each hit-id as a distinct flat colour. xorshift32 seeded
+    /// from the frame-independent address of `self` — debug-quality, no determinism need.
+    fn regen_debug_hit_colours(&mut self) {
+        let mut s: u32 = (self as *const _ as usize as u32) | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
         };
-        let width = self.width as usize;
-        let rect = layout.rect;
-
-        self.renderer
-            .mark_rows(rect.y as u32, (rect.y + rect.h) as u32);
-        let mut buffer = self.renderer.lock_buffer();
-        let pixels: &mut [u32] = &mut buffer;
-
-        if self.blinkey_visible {
-            // Subtract using the orientation chosen when this blinkey was added.
-            render_blinkey(
-                pixels,
-                width,
-                self.last_blinkey_x,
-                self.last_blinkey_top,
-                self.last_blinkey_height,
-                self.blinkey_top_bright,
-                false,
-            );
-            self.blinkey_visible = false;
-        } else {
-            // Pick a fresh random orientation for this ON-event.
-            self.blinkey_top_bright = rand::thread_rng().r#gen();
-            let bx = layout.cursor_x(&self.text_state);
-            render_blinkey(
-                pixels,
-                width,
-                bx,
-                layout.blinkey_top,
-                layout.blinkey_height,
-                self.blinkey_top_bright,
-                true,
-            );
-            self.last_blinkey_x = bx;
-            self.last_blinkey_top = layout.blinkey_top;
-            self.last_blinkey_height = layout.blinkey_height;
-            self.blinkey_visible = true;
+        self.debug_hit_colours.clear();
+        self.debug_hit_colours.reserve(256);
+        for _ in 0..256 {
+            let r = (next() >> 16) as u8;
+            let g = (next() >> 16) as u8;
+            let b = (next() >> 16) as u8;
+            self.debug_hit_colours
+                .push(fluor::paint::pack_argb(r, g, b, 255));
         }
-
-        let _ = buffer.present();
-        self.next_blink_time = next_blink_wake();
     }
 }
 
-/// Photon's blinkey blink rate: random 0–300 ms per toggle so neighbouring cursors in the same window don't sync up into a metronome.
-fn next_blink_wake() -> Instant {
-    let ms = rand::thread_rng().gen_range(0..=300);
-    Instant::now() + Duration::from_millis(ms)
+/// `[]`-chord debug bindings, for the on-screen hint (`draw_chord_hint`) shown while both
+/// brackets are held. Keys match the dispatch in `handle_debug_chord`.
+const DEBUG_CHORDS: &[(&str, &str)] = &[
+    ("H", "Hit-map overlay"),
+    ("A", "Alpha view (cycle)"),
+    ("P", "Skip premultiply"),
+    ("C", "Skip chrome"),
+    ("L", "Skip controls"),
+    ("F", "FPS strip"),
+    ("W", "Damage outline"),
+    ("D", "Screen decay"),
+    ("B", "Opaque-scan tint"),
+];
+
+/// Decode the bundled plotypus PNG into a Fluor app-icon orb. Resized to 256×256 (Fluor's
+/// canonical orb size; the chrome scales it to the slot via nearest-neighbour) and packed
+/// into Fluor's α + darkness convention (α = `0xFF` opaque, RGB = `255 − visible`). The
+/// chrome masks the square image to a disc at draw time. Returns `None` if decoding fails —
+/// the chrome then simply renders no orb.
+fn load_orb() -> Option<fluor::host::icon::Icon> {
+    const ORB_PNG: &[u8] = include_bytes!("../../assets/plotypus.png");
+    let img = image::load_from_memory(ORB_PNG).ok()?;
+    let resized = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
+    let rgb = resized.to_rgb8();
+    let (width, height) = (rgb.width(), rgb.height());
+    let pixels = rgb
+        .pixels()
+        .map(|p| {
+            let [r, g, b] = p.0;
+            0xFF00_0000
+                | (((255 - r) as u32) << 16)
+                | (((255 - g) as u32) << 8)
+                | ((255 - b) as u32)
+        })
+        .collect();
+    Some(fluor::host::icon::Icon {
+        width,
+        height,
+        pixels,
+    })
 }
 
+/// SplitMix64 finalizer — same well-mixed hash the synth uses for per-user seeds. Maps an
+/// arbitrary `u64` key to a uniformly-spread `u64`. Used to scatter stars deterministically.
+#[inline]
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
-fn point_in_rect(r: Rect, x: f32, y: f32) -> bool {
-    let xi = x as i32;
-    let yi = y as i32;
-    xi >= r.x as i32 && xi < (r.x + r.w) as i32 && yi >= r.y as i32 && yi < (r.y + r.h) as i32
+/// Night-sky starfield background. A vertical gradient (deep space-blue at the top fading
+/// to near-black at the bottom) seeds the canvas; a sparse, deterministic star field is
+/// stamped on top — each star's position + brightness comes from `splitmix64`, the same
+/// hash that derives the Photon-notification voices, so the background and the sound are
+/// cut from the same cloth. A handful of the brightest stars get a faint cross-glint.
+///
+/// Everything is written in Fluor's darkness convention via `pack_argb`. The gradient runs
+/// row-parallel (`par_rows`); the star pass is a single sparse walk. Static — no animation,
+/// so it only repaints when the bg layer is marked dirty.
+fn draw_starfield(canvas: &mut Canvas) {
+    use fluor::paint::pack_argb;
+    let w = canvas.width;
+    let h = canvas.height;
+    if w < 2 || h < 2 {
+        return;
+    }
+    let pixels: &mut [u32] = canvas.pixels;
+
+    // --- Vertical gradient. Top deep-blue → bottom near-black. One precomputed colour
+    // per row (the gradient varies only in y), then a flat row fill. ---
+    for y in 0..h {
+        let t = y as f32 / (h - 1).max(1) as f32;
+        let px = pack_argb(lerp_u8(10, 2, t), lerp_u8(16, 4, t), lerp_u8(38, 9, t), 255);
+        let row = &mut pixels[y * w..y * w + w];
+        row.fill(px);
+    }
+
+    // --- Stars. Walk a coarse grid of cells; each cell deterministically may hold one
+    // star, jittered within the cell. Density + brightness from the hash. ---
+    const CELL: usize = 14; // avg one candidate star per 14×14 px
+    for cy in 0..(h / CELL) {
+        for cx in 0..(w / CELL) {
+            let key = (cy as u64) << 32 | cx as u64;
+            let hsh = splitmix64(key ^ 0x5060_7080_90A0_B0C0);
+            // ~38% of cells actually get a star — sparse, not a checkerboard.
+            if (hsh & 0xFF) > 97 {
+                continue;
+            }
+            // Jitter position inside the cell.
+            let jx = ((hsh >> 8) as usize) % CELL;
+            let jy = ((hsh >> 16) as usize) % CELL;
+            let x = cx * CELL + jx;
+            let y = cy * CELL + jy;
+            if x >= w || y >= h {
+                continue;
+            }
+            // Brightness class from more hash bits: most stars dim, a few bright.
+            let lvl = (hsh >> 24) & 0xFF;
+            let bright: u8 = if lvl < 12 {
+                235 // rare brilliant star
+            } else if lvl < 60 {
+                150
+            } else {
+                85
+            };
+            // Slight cool tint — stars are faintly blue-white.
+            put_star(pixels, w, h, x, y, bright, bright, (bright as u16 + 20).min(255) as u8);
+            // The brilliant ones get a 1-px cross-glint at half brightness.
+            if bright == 235 {
+                let glint = 110u8;
+                put_star(pixels, w, h, x.wrapping_sub(1), y, glint, glint, glint);
+                put_star(pixels, w, h, x + 1, y, glint, glint, glint);
+                put_star(pixels, w, h, x, y.wrapping_sub(1), glint, glint, glint);
+                put_star(pixels, w, h, x, y + 1, glint, glint, glint);
+            }
+        }
+    }
+}
+
+/// Write a single opaque star pixel (darkness convention) if `(x, y)` is in bounds.
+#[inline]
+fn put_star(pixels: &mut [u32], w: usize, h: usize, x: usize, y: usize, r: u8, g: u8, b: u8) {
+    if x < w && y < h {
+        pixels[y * w + x] = fluor::paint::pack_argb(r, g, b, 255);
+    }
+}
+
+/// Integer-channel linear interpolation `a → b` by `t ∈ [0,1]`.
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
 }

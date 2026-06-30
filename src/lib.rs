@@ -1,4 +1,6 @@
+pub mod audio;
 pub mod formula;
+pub mod synth;
 pub mod ui;
 
 #[cfg(feature = "logging")]

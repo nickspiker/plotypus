@@ -1,8 +1,10 @@
 //! Plot region: axes, grid, and curve. View bounds are kept in `PlotView` so pan/zoom can mutate them without touching the rendering code.
+//!
+//! The plot draws straight into the host's CPU present buffer (`&mut [u32]`) that Fluor hands `FluorApp::render`. Grid + curve are raw per-pixel writes; axis labels go through Fluor's `TextRenderer`, which draws into a `Canvas` over the same buffer (constructed after the raw writes finish, so the borrows don't overlap). The plot does no hit-testing — the app routes plot interaction by rect containment, so no per-pixel hit map is threaded here.
 use crate::formula::{self, Token};
-use crate::ui::compositing::HIT_PLOT_AREA;
-use crate::ui::text_rasterizing::TextRenderer;
 use crate::ui::theme;
+use fluor::canvas::{Canvas, Damage};
+use fluor::text::TextRenderer;
 use spirix::ScalarF4E3 as S43;
 
 #[derive(Clone, Copy, Debug)]
@@ -39,26 +41,20 @@ const TOP_BRIGHTNESS: u32 = 128;
 
 pub fn draw_plot(
     pixels: &mut [u32],
-    hit_test_map: &mut [u8],
     text_renderer: &mut TextRenderer,
+    damage: &mut Damage,
     window_width: usize,
+    window_height: usize,
     rect: Rect,
     view: PlotView,
     label_font_size: f32,
     formula: Option<&[Token]>,
     parse_failed: bool,
-    base: u8,
 ) {
-    fill_rect(
-        pixels,
-        hit_test_map,
-        window_width,
-        rect,
-        0xFF_00_00_00,
-        HIT_PLOT_AREA,
-    );
+    fill_rect(pixels, window_width, rect, 0xFF_00_00_00);
     // Parse error → blank black plot region. Skipping grid + labels + curve makes "your formula didn't parse" obvious at a glance, distinct from a valid expression that happens to evaluate offscreen.
     if parse_failed {
+        visible_to_darkness_rect(pixels, window_width, rect);
         return;
     }
     draw_dyadic_grid(pixels, window_width, rect, view);
@@ -66,10 +62,45 @@ pub fn draw_plot(
         // Eval errors (stack underflow, etc.) shouldn't fire on a token vector that
         // tokenize() accepted — but if they do, fall back to INFINITY so the column
         // shows as a yellow stripe (visible, not crashy).
-        let curve = |x: S43| formula::evaluate(tokens, x, base).unwrap_or(S43::INFINITY);
+        let curve = |x: S43| formula::evaluate(tokens, x).unwrap_or(S43::INFINITY);
         draw_curve(pixels, window_width, rect, view, curve);
     }
-    draw_axis_labels(pixels, text_renderer, window_width, rect, view, label_font_size, base);
+    // All the grid/curve/fill math above runs in plain visible-RGB (black base, additive brightness). Flip the rect to Fluor's darkness convention once here — the single import-boundary flip the pixel-format contract expects — before the label pass (which goes through Fluor's text renderer and already speaks darkness).
+    visible_to_darkness_rect(pixels, window_width, rect);
+    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size);
+}
+
+/// Same as [`draw_plot`] but plots an arbitrary `curve: Fn(S43) -> S43` instead of a
+/// parsed formula — used by the Photon notification view, which feeds the synth's S43
+/// `voice(t)` straight in (world-x is time in seconds). Background, grid, and axis
+/// labels are identical to the formula path so the two views are visually consistent.
+pub fn draw_plot_curve(
+    pixels: &mut [u32],
+    text_renderer: &mut TextRenderer,
+    damage: &mut Damage,
+    window_width: usize,
+    window_height: usize,
+    rect: Rect,
+    view: PlotView,
+    label_font_size: f32,
+    curve: impl Fn(S43) -> S43,
+) {
+    fill_rect(pixels, window_width, rect, 0xFF_00_00_00);
+    draw_dyadic_grid(pixels, window_width, rect, view);
+    draw_curve(pixels, window_width, rect, view, curve);
+    // Flip visible-RGB → Fluor darkness convention once, before the (already-darkness) label pass. See `draw_plot`.
+    visible_to_darkness_rect(pixels, window_width, rect);
+    draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size);
+}
+
+/// Complement the RGB bytes of every pixel in `rect` in place (`pixel ^= 0x00FFFFFF`), keeping α. Converts the plot's visible-RGB working buffer into Fluor's darkness-convention buffer (`0 = white potential`, `255 = black ink`) at the plot's import boundary. Called once per frame after all raw pixel writes, before text.
+fn visible_to_darkness_rect(pixels: &mut [u32], window_width: usize, rect: Rect) {
+    for y in rect.y..rect.y + rect.h {
+        let row = y * window_width;
+        for x in rect.x..rect.x + rect.w {
+            pixels[row + x] ^= 0x00FF_FFFF;
+        }
+    }
 }
 
 /// 32×-supersampled area-chart renderer. Each column fills from the curve's pixel-y down to the bottom of the plot rect — no line, no baseline strip, just a filled region whose top edge is the curve.
@@ -203,19 +234,11 @@ pub fn screen_to_world(rect: Rect, view: PlotView, sx: f32, sy: f32) -> (S43, S4
     (wx, wy)
 }
 
-fn fill_rect(
-    pixels: &mut [u32],
-    hit_test_map: &mut [u8],
-    window_width: usize,
-    r: Rect,
-    colour: u32,
-    hit_id: u8,
-) {
+fn fill_rect(pixels: &mut [u32], window_width: usize, r: Rect, colour: u32) {
     for y in r.y..r.y + r.h {
         let row = y * window_width;
         for x in r.x..r.x + r.w {
             pixels[row + x] = colour;
-            hit_test_map[row + x] = hit_id;
         }
     }
 }
@@ -291,17 +314,21 @@ fn draw_dyadic_grid(pixels: &mut [u32], window_width: usize, rect: Rect, view: P
 fn draw_axis_labels(
     pixels: &mut [u32],
     text_renderer: &mut TextRenderer,
+    damage: &mut Damage,
     window_width: usize,
+    window_height: usize,
     rect: Rect,
     view: PlotView,
     font_size: f32,
-    base: u8,
 ) {
     let x_range = view.x_max - view.x_min;
     let y_range = view.y_max - view.y_min;
     if x_range <= 0 || y_range <= 0 || rect.w < 8 || rect.h < 8 {
         return;
     }
+
+    // One Canvas over the present buffer for the whole label pass. Constructed here — after all raw grid/curve pixel writes are done — so the mutable borrow of `pixels` doesn't overlap them.
+    let mut canvas = Canvas::new(pixels, window_width, window_height, damage);
 
     let x_primary = primary_spacing(x_range);
     let y_primary = primary_spacing(y_range);
@@ -311,28 +338,22 @@ fn draw_axis_labels(
     let plot_lft = rect.x as i32;
     let plot_rgt = (rect.x + rect.w) as i32;
 
-    // x-label baseline anchored to world-y=0 row (or nearest plot edge). When the axis is on-screen, labels go toward the plot centre: above the axis if it's in the bottom half, below if it's in the top half.
+    // x-label baseline anchored to world-y=0 row (or nearest plot edge).
     let zero_py = map_y(view, rect, S43::ZERO);
-    let plot_mid_y = (plot_top + plot_bot) / 2;
     let x_label_baseline = if zero_py < plot_top {
         plot_top as f32 + font_size + 2.0
     } else if zero_py > plot_bot {
         plot_bot as f32 - font_size * 0.5 - 2.0
-    } else if zero_py >= plot_mid_y {
-        zero_py as f32 - font_size * 0.5 - 2.0
     } else {
         zero_py as f32 + font_size + 2.0
     };
 
-    // y-label x position anchored to world-x=0 column (or nearest plot edge). When the axis is on-screen, labels go toward the plot centre: left of the axis if it's in the right half, right if it's in the left half.
+    // y-label x position anchored to world-x=0 column (or nearest plot edge). When the axis is past the right edge, right-align into the plot.
     let zero_px = map_x(view, rect, S43::ZERO);
-    let plot_mid_x = (plot_lft + plot_rgt) / 2;
     let (y_label_x, align_left) = if zero_px < plot_lft {
         (plot_lft as f32 + 4.0, true)
     } else if zero_px > plot_rgt {
         (plot_rgt as f32 - 4.0, false)
-    } else if zero_px >= plot_mid_x {
-        (zero_px as f32 - 4.0, false)
     } else {
         (zero_px as f32 + 4.0, true)
     };
@@ -345,43 +366,41 @@ fn draw_axis_labels(
 
     // Level 0 (primary), level 1 (primary/2 odd), level 2 (primary/4 odd).
     draw_x_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, x_primary, true,
-        x_label_baseline, s0, base,
+        &mut canvas, text_renderer, rect, view, x_primary, true,
+        x_label_baseline, s0,
     );
     draw_x_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, x_primary >> 1u8, false,
-        x_label_baseline, s1, base,
+        &mut canvas, text_renderer, rect, view, x_primary >> 1u8, false,
+        x_label_baseline, s1,
     );
     draw_x_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, x_primary >> 2u8, false,
-        x_label_baseline, s2, base,
+        &mut canvas, text_renderer, rect, view, x_primary >> 2u8, false,
+        x_label_baseline, s2,
     );
 
     draw_y_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, y_primary, true,
-        y_label_x, align_left, s0, base,
+        &mut canvas, text_renderer, rect, view, y_primary, true,
+        y_label_x, align_left, s0,
     );
     draw_y_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, y_primary >> 1u8, false,
-        y_label_x, align_left, s1, base,
+        &mut canvas, text_renderer, rect, view, y_primary >> 1u8, false,
+        y_label_x, align_left, s1,
     );
     draw_y_labels_at_level(
-        pixels, text_renderer, window_width, rect, view, y_primary >> 2u8, false,
-        y_label_x, align_left, s2, base,
+        &mut canvas, text_renderer, rect, view, y_primary >> 2u8, false,
+        y_label_x, align_left, s2,
     );
 }
 
 fn draw_x_labels_at_level(
-    pixels: &mut [u32],
+    canvas: &mut Canvas,
     text_renderer: &mut TextRenderer,
-    window_width: usize,
     rect: Rect,
     view: PlotView,
     spacing: S43,
     level_zero: bool,
     baseline_y: f32,
     font_size: f32,
-    base: u8,
 ) {
     let plot_lft = rect.x as i32;
     let plot_rgt = (rect.x + rect.w) as i32;
@@ -395,25 +414,26 @@ fn draw_x_labels_at_level(
         if px <= plot_lft + 4 || px >= plot_rgt - 4 {
             continue;
         }
-        let label = format!("{:4.base$}", v, base = base as usize);
+        let label = format!("{:4.12}", v);
         text_renderer.draw_text_center_u32(
-            pixels,
-            window_width,
+            canvas,
             &label,
             px as f32,
             baseline_y,
             font_size,
             400,
-            theme::TEXT_COLOUR,
+            theme::TEXT_COLOUR ^ 0x00FF_FFFF,
             theme::FONT_UI,
+            None,
+            None,
+            None,
         );
     }
 }
 
 fn draw_y_labels_at_level(
-    pixels: &mut [u32],
+    canvas: &mut Canvas,
     text_renderer: &mut TextRenderer,
-    window_width: usize,
     rect: Rect,
     view: PlotView,
     spacing: S43,
@@ -421,7 +441,6 @@ fn draw_y_labels_at_level(
     label_x: f32,
     align_left: bool,
     font_size: f32,
-    base: u8,
 ) {
     let plot_top = rect.y as i32;
     let plot_bot = (rect.y + rect.h) as i32;
@@ -435,31 +454,35 @@ fn draw_y_labels_at_level(
         if py <= plot_top + (font_size as i32) || py >= plot_bot - 4 {
             continue;
         }
-        let label = format!("{:4.base$}", v, base = base as usize);
+        let label = format!("{:4.12}", v);
         let baseline_y = py as f32 - 2.0;
         if align_left {
             text_renderer.draw_text_left_u32(
-                pixels,
-                window_width,
+                canvas,
                 &label,
                 label_x,
                 baseline_y,
                 font_size,
                 400,
-                theme::TEXT_COLOUR,
+                theme::TEXT_COLOUR ^ 0x00FF_FFFF,
                 theme::FONT_UI,
+                None,
+                None,
+                None,
             );
         } else {
             text_renderer.draw_text_right_u32(
-                pixels,
-                window_width,
+                canvas,
                 &label,
                 label_x,
                 baseline_y,
                 font_size,
                 400,
-                theme::TEXT_COLOUR,
+                theme::TEXT_COLOUR ^ 0x00FF_FFFF,
                 theme::FONT_UI,
+                None,
+                None,
+                None,
             );
         }
     }
