@@ -290,13 +290,54 @@ impl PlotypusApp {
         plot::screen_to_world(self.plot_rect, self.plot_view, sx, sy)
     }
 
-    /// Show the world coords under a plot click in the chrome status line, formatted in the
-    /// current base (Spirix Display takes the format precision as the output radix, like
-    /// the axis labels). Requests a redraw so the readout updates immediately.
+    /// Drop color-emoji faces from the shared font DB so Spirix's Display glyphs render as
+    /// crisp monochrome outlines. cosmic-text's per-glyph fallback otherwise routes the
+    /// heavy transfinite/negligible arrows ⬆ (U+2B06) / ⬇ (U+2B07) — which appear in
+    /// undefined-state tags like `℘⬇/⬇` — to Noto Color Emoji, whose color-bitmap glyphs come
+    /// out shredded (and double-width) through fluor's grayscale swash rasterizer. With the
+    /// color-emoji faces gone, those codepoints fall to a normal monochrome font (Adwaita
+    /// Mono / Symbola / Noto Emoji, whatever the system has) and render correctly. Plotypus
+    /// uses no emoji anywhere, so removing them is free. Note: ⬆/⬇ are NOT ↑/↓ — the heavy
+    /// arrows mean *transfinite* / *negligible* (a class group), so we must render the real
+    /// glyphs rather than substitute the escape arrows.
+    fn drop_color_emoji_fonts(ctx: &mut Context) {
+        let db = ctx.text.font_system_mut().db_mut();
+        let ids: Vec<_> = db
+            .faces()
+            .filter(|f| {
+                f.families
+                    .iter()
+                    .any(|(name, _)| name.to_lowercase().contains("color emoji"))
+            })
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            db.remove_face(id);
+        }
+    }
+
+    /// Show the world x under the cursor AND the function value f(x) there, in the chrome
+    /// status line, formatted in the current base (Spirix Display takes the format precision
+    /// as the output radix, like the axis labels). f(x) is the actual evaluated result — so
+    /// it carries Spirix's class tags (⦉∞⦊, ⦉±↑⦊, ⦉±↓⦊, ℘…) rather than the meaningless
+    /// screen-height the old readout printed for the cursor's y. Requests a redraw so the
+    /// readout updates immediately.
     fn show_click_coords(&mut self, sx: Coord, sy: Coord, ctx: &mut Context) {
-        let (wx, wy) = self.plot_screen_to_world(sx, sy);
+        let (wx, _wy) = self.plot_screen_to_world(sx, sy);
         let b = self.base as usize;
-        let text = format!("x {:6.b$}   y {:6.b$}", wx, wy, b = b);
+        let fx = match self.formula.as_ref() {
+            // Evaluate the plotted expression at the cursor's x. This is the same call the
+            // curve renderer makes per pixel-column, so the readout matches what's drawn.
+            Some(Ok(tokens)) => match formula::evaluate(tokens, wx, self.base) {
+                Ok(v) => format!("{:6.b$}", v, b = b),
+                // evaluate() only errors on a malformed token stream (already caught at parse
+                // time); undefined *math* comes back as an Ok(℘…) value, so this is rare.
+                Err(_) => "℘".to_string(),
+            },
+            // Empty box or parse error → no curve to sample.
+            _ => "—".to_string(),
+        };
+        let text = format!("x {:6.b$}   f(x) {}", wx, fx, b = b);
         if self.chrome.set_status_text(Some(text)) {
             ctx.window.request_redraw();
         }
@@ -485,6 +526,7 @@ impl FluorApp for PlotypusApp {
     }
 
     fn init(&mut self, ctx: &mut Context) {
+        Self::drop_color_emoji_fonts(ctx);
         self.chrome.resize(ctx.viewport);
         self.update_layout(ctx);
         self.reparse_formula();
