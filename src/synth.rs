@@ -170,21 +170,16 @@ impl PhotonVoice {
     }
 }
 
-/// Sample a parsed formula across `[x_min, x_max]` and render it as an audio buffer —
-/// "play exactly what you plotted." `x` sweeps the visible plot x-range linearly over
-/// `duration` seconds (so the curve you see IS the waveform you hear), and `y = f(x)` is
-/// the speaker displacement mapped through the visible y-range `[y_min, y_max]` to the
-/// audio's full scale `[-1, 1]`.
+/// Sample a parsed formula across `[x_min, x_max]` and render it as an audio buffer — "play exactly what you plotted."
+/// `x` sweeps the visible plot x-range linearly over `duration` seconds (so the curve you see IS the waveform you hear), and `y = f(x)` is the speaker displacement mapped through the visible y-range `[y_min, y_max]` to the audio's full scale `[-1, 1]`.
 ///
-/// `eval` takes the world-x as f64 and returns f32: the caller owns the numeric type
-/// (the same precision-dispatched type the plot uses), so what you see IS what you hear.
+/// `eval` takes the world-x as f64 and returns f32: the caller owns the numeric type (the same precision-dispatched type the plot uses), so what you see IS what you hear.
 /// Return NaN for undefined and ±∞ for escaped states.
 ///
-/// The y-axis IS the volume, 1:1: `y_max` → +1.0, `y_min` → -1.0. There is **no
-/// normalization** — if the curve runs off the top/bottom of the view it hard-clips at
-/// ±1.0 and audibly distorts, exactly as a cut-off waveform should. Non-finite samples
-/// rail (±∞) or mute (NaN) rather than popping. A short global fade at the buffer ends
-/// suppresses DAC clicks without touching the body.
+/// The y-axis IS the volume, 1:1: `y_max` → +1.0, `y_min` → -1.0.
+/// There is **no normalization** — if the curve runs off the top/bottom of the view it hard-clips at ±1.0 and audibly distorts, exactly as a cut-off waveform should.
+/// Non-finite samples rail (±∞) or mute (NaN) rather than popping.
+/// A short global fade at the buffer ends suppresses DAC clicks without touching the body.
 pub fn render_formula<F>(
     eval: F,
     x_min: f32,
@@ -206,19 +201,15 @@ where
     let inv_os = 1.0 / OVERSAMPLE as f32;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        // Stratified-jittered oversampling. Each output sample averages OVERSAMPLE evaluations
-        // taken at RANDOM positions within its 1/SR window (one per sub-slice), rather than a
-        // fixed point. Point-sampling a formula whose content runs past Nyquist folds it back
-        // as inharmonic tones + ringing; jittering decorrelates the samples so that aliasing
-        // becomes broadband noise instead (stochastic sampling), and the average knocks that
-        // noise down ~√OVERSAMPLE while preserving the de-aliasing (no sinc sidelobe ringing,
-        // unlike a fixed box filter). Set OVERSAMPLE = 1 for the pure single-jitter version.
+        // Stratified-jittered oversampling: each output sample averages OVERSAMPLE evaluations taken at RANDOM positions within its 1/SR window (one per sub-slice), rather than a fixed point.
+        // Point-sampling a formula whose content runs past Nyquist folds it back as inharmonic tones + ringing; jittering decorrelates the samples so that aliasing becomes broadband noise instead (stochastic sampling), and the average knocks that noise down ~√OVERSAMPLE while preserving the de-aliasing (no sinc sidelobe ringing, unlike a fixed box filter).
+        // Set OVERSAMPLE = 1 for the pure single-jitter version.
         let mut acc = 0.0f32;
         for k in 0..OVERSAMPLE {
             let sub = (k as f32 + sample_jitter(i, k)) * inv_os; // random spot in sub-slice k
             let frac = (i as f32 + sub) / n_f;
             let y = eval(x_min as f64 + frac as f64 * x_span as f64);
-            // Map through the view; non-finite (∞ / escaped / undefined) rails, not pops.
+            // Map through the view; non-finite (∞ / escaped / undefined) rails or mutes, not pops.
             // Averaging a window that straddles a pole softens the spike instead of clicking.
             acc += if y.is_finite() {
                 ((y - y_min) / y_span) * 2.0 - 1.0
@@ -236,14 +227,13 @@ where
     out
 }
 
-/// Jittered sub-samples averaged per output sample (audio anti-aliasing). `1` = a single
-/// random sample within each 1/SR window: cheapest, converts aliasing to noise with no
-/// averaging. Raise it (e.g. 8) to trade evals for ~√OVERSAMPLE lower noise.
+/// Jittered sub-samples averaged per output sample (audio anti-aliasing).
+/// `1` = a single random sample within each 1/SR window: cheapest, converts aliasing to noise with no averaging.
+/// Raise it (e.g. 8) to trade evals for ~√OVERSAMPLE lower noise.
 const OVERSAMPLE: usize = 1;
 
-/// Deterministic per-(sample, sub-sample) jitter in `[0, 1)` — SplitMix64 hash. Deterministic
-/// so a given formula always renders the same clip (reproducible), and well-mixed so the
-/// jitter reads as white noise rather than a periodic pattern.
+/// Deterministic per-(sample, sub-sample) jitter in `[0, 1)` — SplitMix64 hash.
+/// Deterministic so a given formula always renders the same clip (reproducible), and well-mixed so the jitter reads as white noise rather than a periodic pattern.
 #[inline]
 fn sample_jitter(i: usize, k: usize) -> f32 {
     let mut h = (i as u64)

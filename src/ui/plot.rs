@@ -63,8 +63,8 @@ pub fn draw_plot(
     parse_failed: bool,
     base: u8,
     precision: Precision,
-    // Per-plot fixed randoms (uniform, gauss) as f64 — drawn once at commit, constant across x.
-    fixed_rand: (f64, f64),
+    // Per-plot fixed random seeds (uniform, gauss) — rolled once at commit; each @frandN index hashes off them, constant across x.
+    fixed_rand: (u64, u64),
 ) {
     // Parse error → blank black plot region. Skipping grid + labels + curve makes "your formula didn't parse" obvious at a glance, distinct from a valid expression that happens to evaluate offscreen.
     if parse_failed {
@@ -84,11 +84,10 @@ pub fn draw_plot(
         // accepted — but if they do, fall back to INFINITY so the column shows as a yellow
         // stripe (visible, not crashy).
         crate::with_precision!(precision, T, {
-            // Per-plot fixed randoms, materialized once in the plot's type from the f64 values
-            // the app drew at commit time. Same value for every column (constant across x).
+            // Per-plot fixed random seeds the app rolled at commit time — same values for every column (constant across x).
             let fixed = formula::FixedRand {
-                uniform: T::from_f64(fixed_rand.0),
-                gauss: T::from_f64(fixed_rand.1),
+                uniform_seed: fixed_rand.0,
+                gauss_seed: fixed_rand.1,
             };
             let curve = |wx: f64| {
                 formula::evaluate::<T>(tokens, T::from_f64(wx), base, fixed)
@@ -174,10 +173,10 @@ pub fn draw_curve<T: PlotNum>(
     // Opaque fills in darkness convention (complement of the visible magenta/yellow/green).
     const FILL_UNDEFINED: u32 = 0xFF00_0000 | darken(0x00_E0_00_E0); // magenta
     const FILL_INFINITY: u32 = 0xFF00_0000 | darken(0x00_E0_E0_00); // yellow
-    const FILL_ZERO: u32 = 0xFF00_0000 | darken(0x00_00_E0_00); // green
     // Darkness RGB of the normal pink (positive) / blue (negative) fills — fixed colours.
     let pos_rgb = darken(0x00_FF_80_80);
     let neg_rgb = darken(0x00_80_80_FF);
+    let zero_rgb = darken(0x00_00_E0_00); // green — exact-zero samples' coverage bucket
 
     // The camera (view) stays S43; the plotted value type T only governs the curve samples.
     // World-x is computed in f64 (pixel-quantized anyway), then handed to the typed evaluator.
@@ -191,15 +190,16 @@ pub fn draw_curve<T: PlotNum>(
     let rect_h = rect.h as f32;
     let bottom_row = rect.y + rect.h;
 
-    // Per-row supersample coverage for this column, split by sign so a zero-crossing
-    // column blends pink + blue correctly. Each subsample contributes up to 1.0 per row
-    // (fractional on the curve's sub-pixel top row); the column's alpha is coverage/32.
+    // Per-row supersample coverage for this column, split by sign (plus a green exact-zero bucket) so a zero-crossing column blends correctly.
+    // Each subsample contributes up to 1.0 per row (fractional on the curve's sub-pixel top row); the column's alpha is coverage/32.
     let mut cov_pos = vec![0f32; rect.h];
     let mut cov_neg = vec![0f32; rect.h];
+    let mut cov_zero = vec![0f32; rect.h];
 
     for px in 0..rect.w {
         cov_pos.iter_mut().for_each(|c| *c = 0.0);
         cov_neg.iter_mut().for_each(|c| *c = 0.0);
+        cov_zero.iter_mut().for_each(|c| *c = 0.0);
         let abs_px = rect.x + px;
         let base_x = px as f64 * x_scale_f;
         let mut fill: Option<u32> = None;
@@ -207,31 +207,23 @@ pub fn draw_curve<T: PlotNum>(
         let mut fill_from_zero = false;
 
         for ss in 0..SUBSAMPLES {
-            // Stratified jitter: place the sample at a random position WITHIN its 1/32 slice
-            // rather than at the slice start. A regular grid resonates with high-frequency
-            // curves (fast sin, the escaped phase bands) and produces coherent moiré; jitter
-            // turns that into incoherent noise. Deterministic per (column, subsample) so it's
-            // stable frame-to-frame — the plot redraws on the blink timer, and fresh-random
-            // per frame would shimmer.
+            // Stratified jitter: place the sample at a random position WITHIN its 1/32 slice rather than at the slice start.
+            // A regular grid resonates with high-frequency curves (fast sin, the escaped phase bands) and produces coherent moiré; jitter turns that into incoherent noise.
+            // Deterministic per (column, subsample) so it's stable frame-to-frame — the plot redraws on the blink timer, and fresh-random per frame would shimmer.
             let world_x = x_min_f + base_x + (ss as f64 + sample_jitter(px, ss)) * frac_scale_f;
             let world_y = curve(world_x);
 
-            // Off-scale / singular states fill the column as a solid marker rather than
-            // joining the area strip. Full-height: undefined (magenta), infinity (yellow),
-            // exploded (phase-scaled red/blue) — blow past the view. From y=0 down: zero
-            // (green), vanished (phase-scaled red/blue) — ≈0, so they fill what a
-            // zero-valued curve would. `0xFF00_0000 |` makes the phase colour opaque.
+            // Off-scale / singular states fill the column as a solid marker rather than joining the area strip.
+            // Full-height: undefined (magenta), infinity (yellow), exploded (phase-scaled red/blue) — blow past the view.
+            // From y=0 down: vanished (phase-scaled red/blue) — ≈0, so it fills what a zero-valued curve would.
+            // `0xFF00_0000 |` makes the phase colour opaque.
+            // Exact zero is NOT a marker: it is a legitimate y value and accumulates coverage like any normal sample (its own green bucket), so one zero roll in a stochastic formula can't short-circuit the column and hide the other 31 subsamples.
             if world_y.is_undefined() {
                 fill = Some(FILL_UNDEFINED);
                 break;
             }
             if world_y.is_infinite() {
                 fill = Some(FILL_INFINITY);
-                break;
-            }
-            if world_y.is_zero() {
-                fill = Some(FILL_ZERO);
-                fill_from_zero = true;
                 break;
             }
             if world_y.is_exploded() {
@@ -244,14 +236,15 @@ pub fn draw_curve<T: PlotNum>(
                 break;
             }
 
-            // Normal value: accumulate area coverage from the curve's pixel-y down. Special
-            // classes are already filtered above, so world_y here is a finite normal; a huge
-            // normal that overflows f64 to ±inf still tests correctly against the 0/1 bounds.
+            // Normal value (incl. exact zero): accumulate area coverage from the curve's pixel-y down.
+            // Special classes are already filtered above; a huge normal that overflows f64 to ±inf still tests correctly against the 0/1 bounds.
             let curve_frac = (world_y.to_f64() - y_min_f) / y_range_f;
             if curve_frac < 0.0 {
                 continue; // curve below the view → no fill this subsample
             }
-            let cov = if world_y.is_positive() {
+            let cov = if world_y.is_zero() {
+                &mut cov_zero
+            } else if world_y.is_positive() {
                 &mut cov_pos
             } else {
                 &mut cov_neg
@@ -274,8 +267,8 @@ pub fn draw_curve<T: PlotNum>(
         }
 
         if let Some(colour) = fill {
-            // `fill_from_zero` (zero + vanished) → from the y=0 line down, the area a ≈0
-            // curve covers. Otherwise (undefined / infinity / exploded) → full column.
+            // `fill_from_zero` (vanished) → from the y=0 line down, the area a ≈0 curve covers.
+            // Otherwise (undefined / infinity / exploded) → full column.
             let top = if fill_from_zero {
                 let zero_py = map_y(view, rect, S43::ZERO);
                 zero_py.clamp(rect.y as i32, bottom_row as i32) as usize
@@ -287,9 +280,8 @@ pub fn draw_curve<T: PlotNum>(
                 pixels[idx] = pixels[idx].under(colour, BlendMode::Normal);
             }
         } else {
-            // Normal area-fill: under-blend pink / blue per row at α = coverage/32 (so the
-            // 32 supersamples antialias the curve's sloped top edge). The plot is drawn
-            // topmost-first, so this composites UNDER the labels + grid already in place.
+            // Normal area-fill: under-blend pink / blue / green per row at α = coverage/32 (so the 32 supersamples antialias the curve's sloped top edge).
+            // The plot is drawn topmost-first, so this composites UNDER the labels + grid already in place.
             let inv = 255.0 / SUBSAMPLES as f32;
             for i in 0..rect.h {
                 let idx = (rect.y + i) * window_width + abs_px;
@@ -302,6 +294,11 @@ pub fn draw_curve<T: PlotNum>(
                 if cn > 0.0 {
                     let a = (cn * inv).min(255.0) as u32;
                     pixels[idx] = pixels[idx].under((a << 24) | neg_rgb, BlendMode::Normal);
+                }
+                let cz = cov_zero[i];
+                if cz > 0.0 {
+                    let a = (cz * inv).min(255.0) as u32;
+                    pixels[idx] = pixels[idx].under((a << 24) | zero_rgb, BlendMode::Normal);
                 }
             }
         }

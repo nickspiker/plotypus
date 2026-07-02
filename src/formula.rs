@@ -28,10 +28,11 @@ pub const DEFAULT_BASE: u8 = 12;
 enum Precedence {
     // Lowest — bitwise `& | ~` bind looser than `+ -` (variant order defines the ordering).
     Logic,
-    // Bit shifts `<< >>` bind looser than `+ -` (C convention: `a + b << c` = `(a+b) << c`).
-    Shift,
     Addition,
     Multiplication,
+    // Bit shifts `<< >>` sit between `*` and `^`: `x<<n` is x·2^n, so it binds tighter than multiplication (`3*x<<2` = `3*(x<<2)`) but looser than a power (`x<<2^3` = `x<<(2^3)`).
+    // NOT the C layout — C puts shifts below `+`, a K&R-acknowledged design regret where `x<<2+1` silently means `x<<3`.
+    Shift,
     Exponentiation,
     Unary,
     Parenthesis,
@@ -125,8 +126,8 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
 static CONSTANTS: &[(&str, char, &str)] = &[
     ("@catalan", 'C', "Catalan's constant"),
     ("@gamma", 'G', "Euler-Mascheroni constant"),
-    ("@fgrand", 'Z', "fixed gaussian random (one draw per plot)"),
-    ("@frand", 'W', "fixed uniform random -1..1 (one draw per plot)"),
+    ("@fgrand", 'Z', "fixed gaussian random, optional index in current base (@fgrandN), constant per plot"),
+    ("@frand", 'W', "fixed uniform random -1..1, optional index in current base (@frandN), constant per plot"),
     ("@grand", 'z', "gaussian random (fresh per sample)"),
     ("@rand", 'w', "uniform random -1..1 (fresh per sample)"),
     ("@phi", 'P', "Golden ratio"),
@@ -212,7 +213,7 @@ pub fn tokenize(input_str: &str, base: u8) -> Result<Vec<Token>, ParseError> {
             continue;
         }
         if expect_number {
-            if let Ok((token, new_index)) = parse_constant(input, index) {
+            if let Ok((token, new_index)) = parse_constant(input, base, index) {
                 tokens.push(token);
                 index = new_index;
                 start = false;
@@ -276,14 +277,38 @@ pub fn tokenize(input_str: &str, base: u8) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
-/// Per-plot random constants: drawn ONCE when the plot is (re)committed and held constant
-/// across the whole curve — unlike `@rand`/`@grand`, which redraw per sample. `uniform` backs
-/// `@frand`, `gauss` backs `@fgrand`. Passed into `evaluate` so every sample sees the same
-/// draw.
+/// Per-plot random constants: seeded ONCE when the plot is (re)committed and held constant across the whole curve — unlike `@rand`/`@grand`, which redraw per sample.
+/// `@frandN` / `@fgrandN` take an optional index (parsed in the current base); each index is an independent value derived by hashing (seed, index), so `@frand0` and `@frand1` are uncorrelated while every occurrence of the same index agrees.
+/// Bare `@frand` is index 0.
 #[derive(Clone, Copy)]
-pub struct FixedRand<T> {
-    pub uniform: T,
-    pub gauss: T,
+pub struct FixedRand {
+    pub uniform_seed: u64,
+    pub gauss_seed: u64,
+}
+
+/// SplitMix64 of `seed ^ f(idx)` mapped to `[0, 1)` — the per-index expansion of a FixedRand seed.
+fn fixed_mix(seed: u64, idx: u64) -> f64 {
+    let mut z = seed
+        ^ idx
+            .wrapping_add(1)
+            .wrapping_mul(0xD1B5_4A32_D192_ED03);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+impl FixedRand {
+    /// Uniform in `-1..1` for `@frandN`.
+    pub fn uniform(&self, idx: u64) -> f64 {
+        fixed_mix(self.uniform_seed, idx) * 2.0 - 1.0
+    }
+    /// Standard normal for `@fgrandN` — Box-Muller from two independent hashes.
+    pub fn gauss(&self, idx: u64) -> f64 {
+        let u1 = fixed_mix(self.gauss_seed, idx).max(1e-300); // guard ln(0)
+        let u2 = fixed_mix(self.gauss_seed ^ 0xA5A5_A5A5_A5A5_A5A5, idx);
+        (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos()
+    }
 }
 
 // ============================================================================
@@ -294,7 +319,7 @@ pub fn evaluate<T: PlotNum>(
     tokens: &[Token],
     x: T,
     base: u8,
-    fixed: FixedRand<T>,
+    fixed: FixedRand,
 ) -> Result<T, String> {
     let mut output_queue: Vec<T> = Vec::new();
     let mut operator_stack: Vec<char> = Vec::new();
@@ -509,7 +534,7 @@ fn apply_binary_operator<T: PlotNum>(output_queue: &mut Vec<T>, op: char) -> Res
 // machinery dropped)
 // ============================================================================
 
-fn parse_constant(input: &[u8], mut index: usize) -> Result<(Token, usize), ParseError> {
+fn parse_constant(input: &[u8], base: u8, mut index: usize) -> Result<(Token, usize), ParseError> {
     while index < input.len() && (input[index] == b' ' || input[index] == b'_' || input[index] == b'\t') {
         index += 1;
     }
@@ -518,13 +543,24 @@ fn parse_constant(input: &[u8], mut index: usize) -> Result<(Token, usize), Pars
             .to_ascii_lowercase()
             .starts_with(name.as_bytes())
         {
-            return Ok((
-                Token {
-                    operator: op,
-                    ..Token::new()
-                },
-                index + name.len(),
-            ));
+            let mut end = index + name.len();
+            let mut token = Token {
+                operator: op,
+                ..Token::new()
+            };
+            // Fixed randoms take an optional index in the CURRENT base: @frand0, @frand7U (base 36), ...
+            // Each index is an independent draw, constant per commit; bare @frand = index 0.
+            // Digits go into real_integer, same as a numeric literal.
+            if op == 'W' || op == 'Z' {
+                while end < input.len() {
+                    let Some(d) = char_to_digit(input[end] as char, base) else {
+                        break;
+                    };
+                    token.real_integer.push(d);
+                    end += 1;
+                }
+            }
+            return Ok((token, end));
         }
     }
     Err(ParseError::msg("not a constant", index))
@@ -640,7 +676,17 @@ fn parse_operator(input: &[u8], mut index: usize) -> (Token, usize) {
 // Spirix; numeric literals accumulate digits in base BASE)
 // ============================================================================
 
-fn token2num<T: PlotNum>(token: &Token, x: T, base: u8, fixed: FixedRand<T>) -> T {
+/// Index digits of a `@frandN`/`@fgrandN` token (stored in `real_integer`, current base) as a u64.
+/// No digits (bare `@frand`) → 0.
+fn token_rand_index(token: &Token, base: u8) -> u64 {
+    let mut idx = 0u64;
+    for &d in &token.real_integer {
+        idx = idx.wrapping_mul(base as u64).wrapping_add(d as u64);
+    }
+    idx
+}
+
+fn token2num<T: PlotNum>(token: &Token, x: T, base: u8, fixed: FixedRand) -> T {
     match token.operator {
         // Built-in constants (chars match basecalc's CONSTANTS table)
         'E' => T::e(),
@@ -653,9 +699,9 @@ fn token2num<T: PlotNum>(token: &Token, x: T, base: u8, fixed: FixedRand<T>) -> 
         // in the plot / per audio sample), so @rand / @grand render as a noise band.
         'w' => T::random(),
         'z' => T::random_gauss(),
-        // Per-plot random — one draw held constant across the whole curve (@frand / @fgrand).
-        'W' => fixed.uniform,
-        'Z' => fixed.gauss,
+        // Per-plot random — constant across the whole curve, independent per index (@frandN / @fgrandN).
+        'W' => T::from_f64(fixed.uniform(token_rand_index(token, base))),
+        'Z' => T::from_f64(fixed.gauss(token_rand_index(token, base))),
 
         // Regular numeric literal — accumulate base digits in f64, then convert once to T.
         // f64 is ample for user-typed literals; the target precision T applies to the maths,

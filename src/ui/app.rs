@@ -59,6 +59,22 @@ struct PlotDrag {
     last_y: Coord,
 }
 
+/// Everything that affects the plot region's pixels, bit-exact.
+/// Floats are compared as bit patterns (`to_bits`) so NaN/negative-zero can't fool the comparison.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PlotKey {
+    buf_w: usize,
+    buf_h: usize,
+    rect: (usize, usize, usize, usize),
+    view_bits: [u32; 4],
+    font_bits: u32,
+    base: u8,
+    precision: Precision,
+    fixed_rand_bits: (u64, u64),
+    formula_epoch: u64,
+    notification_seed: Option<u64>,
+}
+
 pub struct PlotypusApp {
     title: String,
     chrome: DefaultChrome,
@@ -72,11 +88,10 @@ pub struct PlotypusApp {
     /// Plot precision: which numeric type the curve is evaluated in (a Spirix `ScalarFxEy`
     /// or native f32/f64). Driven by the F / E picker boxes.
     precision: Precision,
-    /// Per-plot fixed randoms `(uniform, gauss)` backing `@frand` / `@fgrand` — one draw held
-    /// constant across the whole curve, re-rolled each time the formula is committed
-    /// (`reparse_formula`). Stored as f64 (type-agnostic); materialized into the plot type at
-    /// render. NOT redrawn per frame, or the plot would flicker on the blink-timer redraws.
-    fixed_rand: (f64, f64),
+    /// Per-plot fixed random seeds `(uniform, gauss)` backing `@frandN` / `@fgrandN` — rolled from the TRNG each time the formula is committed (`reparse_formula`).
+    /// Each `@frandN` index hashes off the seed, so indices are independent but constant across the whole curve.
+    /// NOT re-rolled per frame, or the plot would flicker on the blink-timer redraws.
+    fixed_rand: (u64, u64),
     /// Fraction-size picker — one char `3`..`7` (Spirix frac width), or `8`=f32 / `9`=f64.
     f_box: Textbox,
     /// Exponent-size picker — one char `3`..`7` (Spirix exp width); ignored for f32/f64.
@@ -100,6 +115,16 @@ pub struct PlotypusApp {
     /// parse error (plot blanks); `Some(Ok)` = the plotted token vector.
     formula: Option<Result<Vec<Token>, ParseError>>,
 
+    /// Cached pixels of the plot region from the last full render, `plot_rect.w * plot_rect.h` row-major.
+    /// Curve evaluation at high precision (F6E3+) takes seconds; blink-timer and widget-only redraws must NOT pay that.
+    /// Valid iff `plot_cache_key` matches the current frame's inputs.
+    plot_cache: Vec<u32>,
+    /// Inputs that produced `plot_cache`.
+    /// Any mismatch (pan/zoom, resize, new formula, precision/base change, re-rolled randoms, notification mode) forces a real re-render.
+    plot_cache_key: Option<PlotKey>,
+    /// Bumped every `reparse_formula()` — cheap stand-in for comparing token vectors in the plot cache key.
+    plot_epoch: u64,
+
     /// When `Some`, the plot shows this notification waveform (same S43 `voice(t)` the
     /// speaker plays) instead of the typed formula. Cleared when the formula is edited.
     notification: Option<PhotonVoice>,
@@ -112,8 +137,8 @@ pub struct PlotypusApp {
     /// focused textbox, released on mouse-up).
     is_dragging_select: bool,
 
-    /// OS clipboard handle. Initialised lazily on first use; `None` if arboard fails to
-    /// open (e.g. no display server). Ctrl+C/X/V intercept before widget dispatch.
+    /// OS clipboard handle; `None` if arboard fails to open (e.g. no display server).
+    /// Ctrl+C/X/V intercept before widget dispatch.
     clipboard: Option<arboard::Clipboard>,
 
     /// `[`+`]` debug-chord tracker (see `ChordTracker`).
@@ -230,7 +255,7 @@ impl PlotypusApp {
             base,
             base_box,
             precision,
-            fixed_rand: (0.0, 0.0),
+            fixed_rand: (0, 0),
             f_box,
             e_box,
             duration_box,
@@ -247,6 +272,9 @@ impl PlotypusApp {
             modifiers: ModifiersState::empty(),
             is_maximized: false,
             is_dragging_select: false,
+            plot_cache: Vec::new(),
+            plot_cache_key: None,
+            plot_epoch: 0,
             clipboard: arboard::Clipboard::new().ok(),
             chord: ChordTracker::default(),
             show_hitmask: false,
@@ -327,12 +355,12 @@ impl PlotypusApp {
             Some(formula::parse(&text, self.base))
         };
         self.notification = None;
-        // Re-roll the per-plot fixed randoms: each committed plot gets a fresh @frand/@fgrand,
-        // held constant across the whole curve until the next commit.
+        // Re-roll the per-plot fixed random seeds: each committed plot gets fresh @frandN/@fgrandN values, held constant across the whole curve until the next commit.
         self.fixed_rand = (
-            spirix::ScalarF6E5::random().to_f64(),
-            spirix::ScalarF6E5::random_gauss().to_f64(),
+            spirix::ScalarF6E5::random().to_f64().to_bits(),
+            spirix::ScalarF6E5::random().to_f64().to_bits(),
         );
+        self.plot_epoch = self.plot_epoch.wrapping_add(1);
     }
 
     /// True if `(x, y)` is inside the plot rect.
@@ -395,8 +423,8 @@ impl PlotypusApp {
             // what's drawn (including class tags ⦉∞⦊ / ⦉±↑⦊ / ⦉±↓⦊ / ℘…).
             Some(Ok(tokens)) => crate::with_precision!(self.precision, T, {
                 let fixed = formula::FixedRand {
-                    uniform: T::from_f64(fr.0),
-                    gauss: T::from_f64(fr.1),
+                    uniform_seed: fr.0,
+                    gauss_seed: fr.1,
                 };
                 match formula::evaluate::<T>(tokens, T::from_f64(wx_f), base, fixed) {
                     Ok(v) => v.display(base),
@@ -519,17 +547,14 @@ impl PlotypusApp {
         let y_max = self.plot_view.y_max.to_f32();
         let duration = self.play_duration();
         let fixed_rand = self.fixed_rand;
-        // Map y through the visible y-range to audio full-scale, 1:1 — the vertical axis
-        // IS the volume, so a curve that runs off the top/bottom clips and distorts.
-        // Evaluate in the SAME picker-selected precision as the plot — what you see is
-        // what you hear. (An S43 audio path under an F6E3 plot silently NaN'd every sin
-        // whose argument blew past the coarser type's period gate.)
-        // reparse_formula() above just re-rolled the per-plot randoms, so this clip's
-        // @frand/@fgrand match the freshly committed plot.
+        // Map y through the visible y-range to audio full-scale, 1:1 — the vertical axis IS the volume, so a curve that runs off the top/bottom clips and distorts.
+        // Evaluate in the SAME picker-selected precision as the plot — what you see is what you hear.
+        // (An S43 audio path under an F6E3 plot silently NaN'd every sin whose argument blew past the coarser type's period gate.)
+        // reparse_formula() above just re-rolled the per-plot randoms, so this clip's @frand/@fgrand match the freshly committed plot.
         let samples = crate::with_precision!(self.precision, T, {
             let fixed = formula::FixedRand {
-                uniform: T::from_f64(fixed_rand.0),
-                gauss: T::from_f64(fixed_rand.1),
+                uniform_seed: fixed_rand.0,
+                gauss_seed: fixed_rand.1,
             };
             synth::render_formula(
                 |wx: f64| {
@@ -880,41 +905,78 @@ impl FluorApp for PlotypusApp {
         let label_font_size = (ctx.viewport.effective_span() / 64.0).max(10.0);
         let base = self.base;
         if self.plot_rect.w > 4 && self.plot_rect.h > 4 {
-            if let Some(voice) = self.notification {
-                plot::draw_plot_curve(
-                    target,
-                    ctx.text,
-                    ctx.damage,
-                    buf_w,
-                    buf_h,
-                    self.plot_rect,
-                    self.plot_view,
-                    label_font_size,
-                    base,
-                    |x: S43| voice.voice(x.to_f32()),
-                );
+            let r = self.plot_rect;
+            // Curve evaluation at high precision takes seconds; blink ticks and widget-only redraws must not re-run it.
+            // If nothing that feeds the plot changed, blit the cached pixels; otherwise render for real and refresh the cache.
+            let key = PlotKey {
+                buf_w,
+                buf_h,
+                rect: (r.x, r.y, r.w, r.h),
+                view_bits: [
+                    self.plot_view.x_min.to_f32().to_bits(),
+                    self.plot_view.x_max.to_f32().to_bits(),
+                    self.plot_view.y_min.to_f32().to_bits(),
+                    self.plot_view.y_max.to_f32().to_bits(),
+                ],
+                font_bits: (label_font_size as f32).to_bits(),
+                base,
+                precision: self.precision,
+                fixed_rand_bits: self.fixed_rand,
+                formula_epoch: self.plot_epoch,
+                notification_seed: self.notification.map(|v| v.seed()),
+            };
+            let cache_hit = self.plot_cache_key == Some(key)
+                && self.plot_cache.len() == r.w * r.h;
+            if cache_hit {
+                for row in 0..r.h {
+                    let dst = (r.y + row) * buf_w + r.x;
+                    let src = row * r.w;
+                    target[dst..dst + r.w].copy_from_slice(&self.plot_cache[src..src + r.w]);
+                }
             } else {
-                let formula = self
-                    .formula
-                    .as_ref()
-                    .and_then(|r| r.as_ref().ok())
-                    .map(|v| v.as_slice());
-                let parse_failed = matches!(&self.formula, Some(Err(_)));
-                plot::draw_plot(
-                    target,
-                    ctx.text,
-                    ctx.damage,
-                    buf_w,
-                    buf_h,
-                    self.plot_rect,
-                    self.plot_view,
-                    label_font_size,
-                    formula,
-                    parse_failed,
-                    base,
-                    self.precision,
-                    self.fixed_rand,
-                );
+                if let Some(voice) = self.notification {
+                    plot::draw_plot_curve(
+                        target,
+                        ctx.text,
+                        ctx.damage,
+                        buf_w,
+                        buf_h,
+                        self.plot_rect,
+                        self.plot_view,
+                        label_font_size,
+                        base,
+                        |x: S43| voice.voice(x.to_f32()),
+                    );
+                } else {
+                    let formula = self
+                        .formula
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|v| v.as_slice());
+                    let parse_failed = matches!(&self.formula, Some(Err(_)));
+                    plot::draw_plot(
+                        target,
+                        ctx.text,
+                        ctx.damage,
+                        buf_w,
+                        buf_h,
+                        self.plot_rect,
+                        self.plot_view,
+                        label_font_size,
+                        formula,
+                        parse_failed,
+                        base,
+                        self.precision,
+                        self.fixed_rand,
+                    );
+                }
+                self.plot_cache.resize(r.w * r.h, 0);
+                for row in 0..r.h {
+                    let src = (r.y + row) * buf_w + r.x;
+                    let dst = row * r.w;
+                    self.plot_cache[dst..dst + r.w].copy_from_slice(&target[src..src + r.w]);
+                }
+                self.plot_cache_key = Some(key);
             }
         }
 
@@ -1165,8 +1227,7 @@ impl PlotypusApp {
                 }
             }
         }
-        // Ctrl/Cmd+C/X/V — clipboard ops intercepted here (before widget delivery, per
-        // fluor's design: the OS clipboard is a single global resource owned by the app).
+        // Ctrl/Cmd+C/X/V — clipboard ops intercepted here (before widget delivery, per fluor's design: the OS clipboard is a single global resource owned by the app).
         if zoom_mod {
             if let Key::Character(c) = &kev.logical_key {
                 let is_cvx = c.eq_ignore_ascii_case("c")
@@ -1182,9 +1243,8 @@ impl PlotypusApp {
                             || focus_id == self.duration_box.hit_id();
                         if is_known {
                             if c.eq_ignore_ascii_case("c") || c.eq_ignore_ascii_case("x") {
-                                // Copy: read selection text first (immutable box borrow), then
-                                // write to clipboard (mutable self.clipboard borrow). Borrows
-                                // are sequential so rustc is happy.
+                                // Copy: read selection text first (immutable box borrow), then write to clipboard (mutable self.clipboard borrow).
+                                // Borrows are sequential so rustc is happy.
                                 let selected = self.focused_box(focus_id)
                                     .and_then(|tb| tb.selected_text());
                                 if let Some(s) = selected {
@@ -1199,8 +1259,7 @@ impl PlotypusApp {
                                     ctx.window.request_redraw();
                                 }
                             } else {
-                                // Paste: read clipboard (mutable self.clipboard borrow) first,
-                                // then write into the box (mutable field borrow). Again sequential.
+                                // Paste: read clipboard (mutable self.clipboard borrow) first, then write into the box (mutable field borrow). Again sequential.
                                 let pasted = self.clipboard.as_mut()
                                     .and_then(|cb| cb.get_text().ok())
                                     .map(|s| s.chars().filter(|ch| *ch != '\n' && *ch != '\r').collect::<String>());
