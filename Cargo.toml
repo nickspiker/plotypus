@@ -30,6 +30,10 @@ cpal = "0.18.1"
 # PNG decode for the app-icon orb (assets/plotypus.png → fluor::host::icon::Icon).
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# arboard: OS clipboard (read/write text). Not available on Redox so declared per-target.
+[target.'cfg(not(target_os = "redox"))'.dependencies]
+arboard = "3.6"
+
 [profile.dev]
 opt-level = 2
 overflow-checks = false

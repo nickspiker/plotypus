@@ -24,6 +24,7 @@ use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::widget::{self as widget, Container, TabDir, Widget};
 use fluor::widgets::{BlinkTimer, Button, Textbox};
+use crate::plotnum::{PlotNum, Precision};
 use spirix::ScalarF4E3 as S43;
 use std::time::Instant;
 
@@ -68,6 +69,18 @@ pub struct PlotypusApp {
     base: u8,
     /// Base selector — a one-char box showing `formula::base_to_char(self.base)`.
     base_box: Textbox,
+    /// Plot precision: which numeric type the curve is evaluated in (a Spirix `ScalarFxEy`
+    /// or native f32/f64). Driven by the F / E picker boxes.
+    precision: Precision,
+    /// Per-plot fixed randoms `(uniform, gauss)` backing `@frand` / `@fgrand` — one draw held
+    /// constant across the whole curve, re-rolled each time the formula is committed
+    /// (`reparse_formula`). Stored as f64 (type-agnostic); materialized into the plot type at
+    /// render. NOT redrawn per frame, or the plot would flicker on the blink-timer redraws.
+    fixed_rand: (f64, f64),
+    /// Fraction-size picker — one char `3`..`7` (Spirix frac width), or `8`=f32 / `9`=f64.
+    f_box: Textbox,
+    /// Exponent-size picker — one char `3`..`7` (Spirix exp width); ignored for f32/f64.
+    e_box: Textbox,
     /// Duration input (seconds) — how long the play sweep takes to cross the viewed
     /// x-range. Parsed as a plain decimal; falls back to `DEFAULT_DURATION` if invalid.
     duration_box: Textbox,
@@ -98,6 +111,10 @@ pub struct PlotypusApp {
     /// True while a left-drag is extending a textbox selection (armed on press inside a
     /// focused textbox, released on mouse-up).
     is_dragging_select: bool,
+
+    /// OS clipboard handle. Initialised lazily on first use; `None` if arboard fails to
+    /// open (e.g. no display server). Ctrl+C/X/V intercept before widget dispatch.
+    clipboard: Option<arboard::Clipboard>,
 
     /// `[`+`]` debug-chord tracker (see `ChordTracker`).
     chord: ChordTracker,
@@ -177,6 +194,23 @@ impl PlotypusApp {
         base_box.chars.push(formula::base_to_char(base));
         base_box.cursor = base_box.chars.len();
 
+        // Precision pickers: F (fraction size 3..7, or 8=f32 / 9=f64) and E (exponent size
+        // 3..7). Default F4E3 matches the type the plotter used before the picker existed.
+        let precision = Precision::DEFAULT;
+        let (f_char, e_char) = match precision {
+            Precision::Scalar(f, e) => ((b'0' + f) as char, (b'0' + e) as char),
+            Precision::F32 => ('8', '3'),
+            Precision::F64 => ('9', '3'),
+        };
+        let mut f_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        f_box.stroke_ru = 1.0 / 12.0;
+        f_box.chars.push(f_char);
+        f_box.cursor = f_box.chars.len();
+        let mut e_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        e_box.stroke_ru = 1.0 / 12.0;
+        e_box.chars.push(e_char);
+        e_box.cursor = e_box.chars.len();
+
         // Duration box: how many seconds the play sweep takes to cross the viewed x-range.
         let mut duration_box = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
         duration_box.stroke_ru = 1.0 / 12.0;
@@ -195,6 +229,10 @@ impl PlotypusApp {
             formula_box,
             base,
             base_box,
+            precision,
+            fixed_rand: (0.0, 0.0),
+            f_box,
+            e_box,
             duration_box,
             play_button,
             hit_counter,
@@ -209,6 +247,7 @@ impl PlotypusApp {
             modifiers: ModifiersState::empty(),
             is_maximized: false,
             is_dragging_select: false,
+            clipboard: arboard::Clipboard::new().ok(),
             chord: ChordTracker::default(),
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
@@ -230,24 +269,40 @@ impl PlotypusApp {
         let chrome_bar = bw * 2.0;
         let row_cy = chrome_bar + gap + row_h * 0.5;
 
-        // Row layout, left→right: formula (flexible) · base (one char) · duration (narrow)
-        // · play button (fixed). The formula box absorbs whatever width the rest leave.
+        // Row layout, left→right: formula (flexible) · base · F · E · duration · play. The
+        // formula box absorbs whatever width the fixed-size controls leave. Positions are
+        // laid out by a running left edge so inserting a control only touches this block.
         let button_w = (bw * 8.0).min(w * 0.25);
         let dur_w = (bw * 5.0).min(w * 0.15);
         let base_w = bw * 2.5;
+        let fe_w = bw * 2.0; // each of the F / E pickers
         let content_w = w - margin * 2.0;
-        let tb_w = (content_w - base_w - dur_w - button_w - gap * 3.0).max(bw * 4.0);
-
-        let tb_cx = margin + tb_w * 0.5;
-        let base_cx = margin + tb_w + gap + base_w * 0.5;
-        let dur_cx = margin + tb_w + gap + base_w + gap + dur_w * 0.5;
-        let btn_cx = margin + tb_w + gap + base_w + gap + dur_w + gap + button_w * 0.5;
+        // Five gaps between the six controls.
+        let tb_w =
+            (content_w - base_w - fe_w * 2.0 - dur_w - button_w - gap * 5.0).max(bw * 4.0);
         let font_size = bw;
+
+        let mut left = margin;
+        let tb_cx = left + tb_w * 0.5;
+        left += tb_w + gap;
+        let base_cx = left + base_w * 0.5;
+        left += base_w + gap;
+        let f_cx = left + fe_w * 0.5;
+        left += fe_w + gap;
+        let e_cx = left + fe_w * 0.5;
+        left += fe_w + gap;
+        let dur_cx = left + dur_w * 0.5;
+        left += dur_w + gap;
+        let btn_cx = left + button_w * 0.5;
 
         self.formula_box.set_rect(tb_cx, row_cy, tb_w, row_h);
         self.formula_box.set_font_size(font_size, ctx.text);
         self.base_box.set_rect(base_cx, row_cy, base_w, row_h);
         self.base_box.set_font_size(font_size, ctx.text);
+        self.f_box.set_rect(f_cx, row_cy, fe_w, row_h);
+        self.f_box.set_font_size(font_size, ctx.text);
+        self.e_box.set_rect(e_cx, row_cy, fe_w, row_h);
+        self.e_box.set_font_size(font_size, ctx.text);
         self.duration_box.set_rect(dur_cx, row_cy, dur_w, row_h);
         self.duration_box.set_font_size(font_size, ctx.text);
         self.play_button.set_rect(btn_cx, row_cy, button_w, row_h);
@@ -272,6 +327,12 @@ impl PlotypusApp {
             Some(formula::parse(&text, self.base))
         };
         self.notification = None;
+        // Re-roll the per-plot fixed randoms: each committed plot gets a fresh @frand/@fgrand,
+        // held constant across the whole curve until the next commit.
+        self.fixed_rand = (
+            spirix::ScalarF6E5::random().to_f64(),
+            spirix::ScalarF6E5::random_gauss().to_f64(),
+        );
     }
 
     /// True if `(x, y)` is inside the plot rect.
@@ -325,19 +386,31 @@ impl PlotypusApp {
     fn show_click_coords(&mut self, sx: Coord, sy: Coord, ctx: &mut Context) {
         let (wx, _wy) = self.plot_screen_to_world(sx, sy);
         let b = self.base as usize;
+        let base = self.base;
+        let wx_f = wx.to_f64();
+        let fr = self.fixed_rand;
         let fx = match self.formula.as_ref() {
-            // Evaluate the plotted expression at the cursor's x. This is the same call the
-            // curve renderer makes per pixel-column, so the readout matches what's drawn.
-            Some(Ok(tokens)) => match formula::evaluate(tokens, wx, self.base) {
-                Ok(v) => format!("{:6.b$}", v, b = b),
-                // evaluate() only errors on a malformed token stream (already caught at parse
-                // time); undefined *math* comes back as an Ok(℘…) value, so this is rare.
-                Err(_) => "℘".to_string(),
-            },
+            // Evaluate the plotted expression at the cursor's x, in the SELECTED precision —
+            // the same type + call the curve renderer uses per column, so the readout matches
+            // what's drawn (including class tags ⦉∞⦊ / ⦉±↑⦊ / ⦉±↓⦊ / ℘…).
+            Some(Ok(tokens)) => crate::with_precision!(self.precision, T, {
+                let fixed = formula::FixedRand {
+                    uniform: T::from_f64(fr.0),
+                    gauss: T::from_f64(fr.1),
+                };
+                match formula::evaluate::<T>(tokens, T::from_f64(wx_f), base, fixed) {
+                    Ok(v) => v.display(base),
+                    // evaluate() only errors on a malformed token stream (already caught at
+                    // parse time); undefined *math* comes back as an Ok(℘…) value.
+                    Err(_) => "℘".to_string(),
+                }
+            }),
             // Empty box or parse error → no curve to sample.
             _ => "—".to_string(),
         };
-        let text = format!("x {:6.b$}   f(x) {}", wx, fx, b = b);
+        // No width field → Spirix's auto digit count (matches the value's real precision);
+        // `.b$` sets only the base. Same convention f(x) uses via display(base).
+        let text = format!("x {:.b$}   f(x) {}   [{}]", wx, fx, self.precision.label(), b = b);
         if self.chrome.set_status_text(Some(text)) {
             ctx.window.request_redraw();
         }
@@ -445,16 +518,32 @@ impl PlotypusApp {
         let y_min = self.plot_view.y_min.to_f32();
         let y_max = self.plot_view.y_max.to_f32();
         let duration = self.play_duration();
+        let fixed_rand = self.fixed_rand;
         // Map y through the visible y-range to audio full-scale, 1:1 — the vertical axis
         // IS the volume, so a curve that runs off the top/bottom clips and distorts.
-        let samples = synth::render_formula(
-            |x: S43| formula::evaluate(&tokens, x, base).unwrap_or(S43::ZERO),
-            x_min,
-            x_max,
-            y_min,
-            y_max,
-            duration,
-        );
+        // Evaluate in the SAME picker-selected precision as the plot — what you see is
+        // what you hear. (An S43 audio path under an F6E3 plot silently NaN'd every sin
+        // whose argument blew past the coarser type's period gate.)
+        // reparse_formula() above just re-rolled the per-plot randoms, so this clip's
+        // @frand/@fgrand match the freshly committed plot.
+        let samples = crate::with_precision!(self.precision, T, {
+            let fixed = formula::FixedRand {
+                uniform: T::from_f64(fixed_rand.0),
+                gauss: T::from_f64(fixed_rand.1),
+            };
+            synth::render_formula(
+                |wx: f64| {
+                    formula::evaluate::<T>(&tokens, T::from_f64(wx), base, fixed)
+                        .map(|y| y.to_f64() as f32)
+                        .unwrap_or(f32::NAN)
+                },
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+                duration,
+            )
+        });
         crate::audio::play(samples);
     }
 
@@ -479,6 +568,10 @@ impl PlotypusApp {
             Some(&mut self.formula_box)
         } else if focus == self.base_box.hit_id() {
             Some(&mut self.base_box)
+        } else if focus == self.f_box.hit_id() {
+            Some(&mut self.f_box)
+        } else if focus == self.e_box.hit_id() {
+            Some(&mut self.e_box)
         } else if focus == self.duration_box.hit_id() {
             Some(&mut self.duration_box)
         } else {
@@ -506,6 +599,8 @@ impl Container for PlotypusApp {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         f(&mut self.formula_box);
         f(&mut self.base_box);
+        f(&mut self.f_box);
+        f(&mut self.e_box);
         f(&mut self.duration_box);
         f(&mut self.play_button);
         self.chrome.visit(f);
@@ -729,7 +824,16 @@ impl FluorApp for PlotypusApp {
             Event::KeyboardInput { event: kev } => self.handle_key(kev, ctx),
 
             Event::Focused(focused) => {
-                if self.chrome.set_focused(*focused) {
+                let mut redraw = self.chrome.set_focused(*focused);
+                // Window lost focus → drop keyboard focus so the textbox stops blinking. A
+                // cursor blinking in a background window reads as still-active; regaining
+                // window focus doesn't auto-restore it (the user clicks to re-focus).
+                // change_focus(None) unfocuses the box and stops the blink timer.
+                if !*focused && self.current_focus.is_some() {
+                    self.change_focus(None, ctx);
+                    redraw = true;
+                }
+                if redraw {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
@@ -808,6 +912,8 @@ impl FluorApp for PlotypusApp {
                     formula,
                     parse_failed,
                     base,
+                    self.precision,
+                    self.fixed_rand,
                 );
             }
         }
@@ -836,6 +942,28 @@ impl FluorApp for PlotypusApp {
                 None,
                 Some(&mut self.chrome.hit_test_map),
                 base_id,
+            );
+            let f_id = self.f_box.hit_id();
+            self.f_box.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                f_id,
+            );
+            let e_id = self.e_box.hit_id();
+            self.e_box.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                e_id,
             );
             let did = self.duration_box.hit_id();
             self.duration_box.render_content_into(
@@ -869,6 +997,12 @@ impl FluorApp for PlotypusApp {
         } else if self.current_focus == Some(self.base_box.hit_id()) {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             self.base_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
+        } else if self.current_focus == Some(self.f_box.hit_id()) {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            self.f_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
+        } else if self.current_focus == Some(self.e_box.hit_id()) {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            self.e_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
         } else if self.current_focus == Some(self.duration_box.hit_id()) {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             self.duration_box.render_blinkey_into(&mut canvas, 0.0, 0.0);
@@ -959,6 +1093,23 @@ impl FluorApp for PlotypusApp {
 }
 
 impl PlotypusApp {
+    /// Returns a mutable reference to whichever known textbox owns `focus_id`, or `None`.
+    fn focused_box(&mut self, focus_id: HitId) -> Option<&mut Textbox> {
+        if focus_id == self.formula_box.hit_id() {
+            Some(&mut self.formula_box)
+        } else if focus_id == self.base_box.hit_id() {
+            Some(&mut self.base_box)
+        } else if focus_id == self.f_box.hit_id() {
+            Some(&mut self.f_box)
+        } else if focus_id == self.e_box.hit_id() {
+            Some(&mut self.e_box)
+        } else if focus_id == self.duration_box.hit_id() {
+            Some(&mut self.duration_box)
+        } else {
+            None
+        }
+    }
+
     /// Keyboard handling: Tab/Esc focus control, Enter/Ctrl+P play, else deliver to the
     /// focused widget and re-parse on textbox edits.
     fn handle_key(&mut self, kev: &KeyEvent, ctx: &mut Context) -> EventResponse {
@@ -1014,6 +1165,59 @@ impl PlotypusApp {
                 }
             }
         }
+        // Ctrl/Cmd+C/X/V — clipboard ops intercepted here (before widget delivery, per
+        // fluor's design: the OS clipboard is a single global resource owned by the app).
+        if zoom_mod {
+            if let Key::Character(c) = &kev.logical_key {
+                let is_cvx = c.eq_ignore_ascii_case("c")
+                    || c.eq_ignore_ascii_case("x")
+                    || c.eq_ignore_ascii_case("v");
+                if is_cvx {
+                    if let Some(focus_id) = self.current_focus {
+                        // Map focus_id → one of the known textboxes.
+                        let is_known = focus_id == self.formula_box.hit_id()
+                            || focus_id == self.base_box.hit_id()
+                            || focus_id == self.f_box.hit_id()
+                            || focus_id == self.e_box.hit_id()
+                            || focus_id == self.duration_box.hit_id();
+                        if is_known {
+                            if c.eq_ignore_ascii_case("c") || c.eq_ignore_ascii_case("x") {
+                                // Copy: read selection text first (immutable box borrow), then
+                                // write to clipboard (mutable self.clipboard borrow). Borrows
+                                // are sequential so rustc is happy.
+                                let selected = self.focused_box(focus_id)
+                                    .and_then(|tb| tb.selected_text());
+                                if let Some(s) = selected {
+                                    if let Some(cb) = self.clipboard.as_mut() {
+                                        let _ = cb.set_text(s);
+                                    }
+                                }
+                                if c.eq_ignore_ascii_case("x") {
+                                    if let Some(tb) = self.focused_box(focus_id) {
+                                        tb.delete_selection(&mut *ctx.text);
+                                    }
+                                    ctx.window.request_redraw();
+                                }
+                            } else {
+                                // Paste: read clipboard (mutable self.clipboard borrow) first,
+                                // then write into the box (mutable field borrow). Again sequential.
+                                let pasted = self.clipboard.as_mut()
+                                    .and_then(|cb| cb.get_text().ok())
+                                    .map(|s| s.chars().filter(|ch| *ch != '\n' && *ch != '\r').collect::<String>());
+                                if let Some(s) = pasted {
+                                    if let Some(tb) = self.focused_box(focus_id) {
+                                        tb.insert_str(&s, &mut *ctx.text);
+                                    }
+                                    ctx.window.request_redraw();
+                                }
+                            }
+                            return EventResponse::Handled;
+                        }
+                    }
+                }
+            }
+        }
+
         // Enter → commit the typed formula: evaluate, replot, and play it as audio.
         if matches!(kev.logical_key, Key::Named(NamedKey::Enter)) {
             self.play_formula();
@@ -1042,8 +1246,42 @@ impl PlotypusApp {
                 self.base_box.insert_char(formula::base_to_char(self.base), &mut *ctx.text);
                 self.reparse_formula();
             }
+            if focus_id == self.f_box.hit_id() || focus_id == self.e_box.hit_id() {
+                // Each picker holds one char. Adopt the last typed digit, collapse the box
+                // back to it, and update the plot precision (keeping the old value if the
+                // new F/E combo is out of range). No re-parse needed — the token vector is
+                // type-agnostic; only the plot's evaluation type changes.
+                let is_f = focus_id == self.f_box.hit_id();
+                let typed = if is_f { self.f_box.chars.last().copied() } else { self.e_box.chars.last().copied() };
+                let (cur_f, cur_e) = match self.precision {
+                    Precision::Scalar(f, e) => ((b'0' + f) as char, (b'0' + e) as char),
+                    Precision::F32 => ('8', '3'),
+                    Precision::F64 => ('9', '3'),
+                };
+                let (want_f, want_e) = if is_f {
+                    (typed.unwrap_or(cur_f), cur_e)
+                } else {
+                    (cur_f, typed.unwrap_or(cur_e))
+                };
+                if let Some(p) = Precision::from_chars(want_f, want_e) {
+                    self.precision = p;
+                }
+                // Reflect the resolved precision back into both boxes (canonicalizes and, for
+                // f32/f64, shows the sentinel F with a placeholder E).
+                let (fc, ec) = match self.precision {
+                    Precision::Scalar(f, e) => ((b'0' + f) as char, (b'0' + e) as char),
+                    Precision::F32 => ('8', '3'),
+                    Precision::F64 => ('9', '3'),
+                };
+                self.f_box.clear();
+                self.f_box.insert_char(fc, &mut *ctx.text);
+                self.e_box.clear();
+                self.e_box.insert_char(ec, &mut *ctx.text);
+            }
             if focus_id == self.formula_box.hit_id()
                 || focus_id == self.base_box.hit_id()
+                || focus_id == self.f_box.hit_id()
+                || focus_id == self.e_box.hit_id()
                 || focus_id == self.duration_box.hit_id()
             {
                 // Keep the cursor solid + blink-restarted while actively typing.

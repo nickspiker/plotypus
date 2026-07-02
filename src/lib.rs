@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod formula;
+pub mod plotnum;
 pub mod synth;
 pub mod ui;
 

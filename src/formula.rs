@@ -14,6 +14,7 @@
 //!
 //! The function-name and control-flow shape is preserved so behaviour matches basecalc's.
 
+use crate::plotnum::PlotNum;
 use spirix::ScalarF4E3 as S43;
 
 /// Default numeric base (dozenal — basecalc heritage). Overridden at runtime by the base
@@ -27,6 +28,8 @@ pub const DEFAULT_BASE: u8 = 12;
 enum Precedence {
     // Lowest — bitwise `& | ~` bind looser than `+ -` (variant order defines the ordering).
     Logic,
+    // Bit shifts `<< >>` bind looser than `+ -` (C convention: `a + b << c` = `(a+b) << c`).
+    Shift,
     Addition,
     Multiplication,
     Exponentiation,
@@ -67,6 +70,10 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
     ("^", '^', 2, "exponentiation"),
     ("%", '%', 2, "modulus"),
     ("$", '$', 2, "logarithm (number$base = log base of number)"),
+    // Bit shifts — Spirix's power-of-two scale by an integer amount (RHS truncated to int).
+    // `<<` = ×2ⁿ, `>>` = ÷2ⁿ. Two chars, so listed before the single-char ops.
+    ("<<", '<', 2, "left shift (×2ⁿ)"),
+    (">>", '>', 2, "right shift (÷2ⁿ)"),
     // Bitwise logic — Spirix's two's-complement ops aligned at the binary point. Binary
     // `& | ~` are lowest precedence (looser than + -), like C. `^` is taken by
     // exponentiation, so xor is `~`. `!` is unary prefix bitwise NOT.
@@ -77,23 +84,39 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
     // Parentheses
     ("(", '(', 1, "left parenthesis"),
     (")", ')', 1, "right parenthesis"),
-    // Common functions
-    ("#sqrt", 'q', 1, "square root"),
-    ("#abs", 'a', 1, "absolute value"),
-    ("#ln", 'l', 1, "natural logarithm"),
-    // Trigonometric functions
-    ("#sin", 's', 1, "sine"),
-    ("#cos", 'o', 1, "cosine"),
-    ("#tan", 't', 1, "tangent"),
+    // Functions. ORDER MATTERS: parse_operator takes the first `starts_with` match, so any
+    // name that is a prefix of another must come after it. `#sinh` before `#sin`, etc.
+    // (Inverse hyperbolics asinh/acosh/atanh are Circle-only in Spirix — not real Scalars.)
+    //
+    // Multi-argument functions: comma-separated args, `fn(a, b[, c])`. The `operands` field
+    // stays 1 (they parse as prefix functions); their true arity lives in `function_arity`.
+    // `#atan2` before `#atan` (prefix), `#clamp` before nothing it collides with.
+    ("#clamp", 'K', 1, "clamp(x, lo, hi)"),
+    ("#atan2", 'A', 1, "two-arg arctangent atan2(y, x)"),
+    ("#min", 'm', 1, "minimum min(a, b)"),
+    ("#max", 'M', 1, "maximum max(a, b)"),
+    ("#square", 'Q', 1, "x squared"),
+    ("#recip", 'R', 1, "reciprocal (1/x)"),
+    ("#round", 'r', 1, "gaussian rounding"),
+    ("#floor", 'f', 1, "gaussian floor"),
+    ("#sinh", 'h', 1, "hyperbolic sine"),
+    ("#cosh", 'H', 1, "hyperbolic cosine"),
+    ("#tanh", 'y', 1, "hyperbolic tangent"),
     ("#asin", 'S', 1, "inverse sine"),
     ("#acos", 'O', 1, "inverse cosine"),
     ("#atan", 'T', 1, "inverse tangent"),
-    // Rounding and parts
-    ("#ceil", 'c', 1, "gaussian ceiling"),
-    ("#floor", 'f', 1, "gaussian floor"),
-    ("#round", 'r', 1, "gaussian rounding"),
-    ("#frac", 'F', 1, "fractional part"),
+    ("#sqrt", 'q', 1, "square root"),
     ("#sign", 'g', 1, "sign"),
+    ("#ceil", 'c', 1, "gaussian ceiling"),
+    ("#frac", 'F', 1, "fractional part"),
+    ("#powb", 'b', 1, "2^x"),
+    ("#exp", 'e', 1, "e^x"),
+    ("#abs", 'a', 1, "absolute value"),
+    ("#sin", 's', 1, "sine"),
+    ("#cos", 'o', 1, "cosine"),
+    ("#tan", 't', 1, "tangent"),
+    ("#lb", 'L', 1, "binary logarithm (log2)"),
+    ("#ln", 'l', 1, "natural logarithm"),
 ];
 
 /// Constants table — basecalc minus `@rand`, `@grand`, `&` (state-dependent), plus `x` as
@@ -102,6 +125,10 @@ static OPERATORS: &[(&str, char, u8, &str)] = &[
 static CONSTANTS: &[(&str, char, &str)] = &[
     ("@catalan", 'C', "Catalan's constant"),
     ("@gamma", 'G', "Euler-Mascheroni constant"),
+    ("@fgrand", 'Z', "fixed gaussian random (one draw per plot)"),
+    ("@frand", 'W', "fixed uniform random -1..1 (one draw per plot)"),
+    ("@grand", 'z', "gaussian random (fresh per sample)"),
+    ("@rand", 'w', "uniform random -1..1 (fresh per sample)"),
     ("@phi", 'P', "Golden ratio"),
     ("@pi", 'p', "Pi"),
     ("@e", 'E', "Euler's number"),
@@ -165,6 +192,23 @@ pub fn tokenize(input_str: &str, base: u8) -> Result<Vec<Token>, ParseError> {
             });
             paren_count -= 1;
             index += 1;
+            continue;
+        }
+        // Argument separator for multi-arg functions. Must follow a completed value; emits a
+        // comma token that the shunting-yard flushes operators against (up to the '(').
+        if input[index] == b',' {
+            if !follows_number {
+                return Err(ParseError::msg("Expected value before comma!", index));
+            }
+            tokens.push(Token {
+                operator: ',',
+                operands: 1,
+                ..Token::new()
+            });
+            index += 1;
+            start = false;
+            expect_number = true;
+            follows_number = false;
             continue;
         }
         if expect_number {
@@ -232,18 +276,33 @@ pub fn tokenize(input_str: &str, base: u8) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
+/// Per-plot random constants: drawn ONCE when the plot is (re)committed and held constant
+/// across the whole curve — unlike `@rand`/`@grand`, which redraw per sample. `uniform` backs
+/// `@frand`, `gauss` backs `@fgrand`. Passed into `evaluate` so every sample sees the same
+/// draw.
+#[derive(Clone, Copy)]
+pub struct FixedRand<T> {
+    pub uniform: T,
+    pub gauss: T,
+}
+
 // ============================================================================
 // evaluate_tokens — basecalc:1642-1796, minus the assignment branch
 // ============================================================================
 
-pub fn evaluate(tokens: &[Token], x: S43, base: u8) -> Result<S43, String> {
-    let mut output_queue: Vec<S43> = Vec::new();
+pub fn evaluate<T: PlotNum>(
+    tokens: &[Token],
+    x: T,
+    base: u8,
+    fixed: FixedRand<T>,
+) -> Result<T, String> {
+    let mut output_queue: Vec<T> = Vec::new();
     let mut operator_stack: Vec<char> = Vec::new();
 
     for token in tokens {
         match token.operands {
             0 => {
-                let mut value = token2num(token, x, base);
+                let mut value = token2num(token, x, base, fixed);
                 while let Some(&op) = operator_stack.last() {
                     if get_precedence(op) == Precedence::Unary {
                         let operator = operator_stack.pop().unwrap();
@@ -269,6 +328,16 @@ pub fn evaluate(tokens: &[Token], x: S43, base: u8) -> Result<S43, String> {
                         if get_precedence(op) == Precedence::Unary {
                             apply_operator(&mut output_queue, operator_stack.pop().unwrap())?;
                         }
+                    }
+                } else if token.operator == ',' {
+                    // Argument separator: apply the current argument's pending operators back
+                    // to the enclosing '(' (left on the stack), leaving each finished arg as a
+                    // single value on the output queue for the function to collect at its ')'.
+                    while let Some(&op) = operator_stack.last() {
+                        if op == '(' {
+                            break;
+                        }
+                        apply_operator(&mut output_queue, operator_stack.pop().unwrap())?;
                     }
                 } else {
                     operator_stack.push(token.operator);
@@ -304,13 +373,37 @@ pub fn evaluate(tokens: &[Token], x: S43, base: u8) -> Result<S43, String> {
 // apply_operator / get_precedence — basecalc:1798-1830
 // ============================================================================
 
-fn apply_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
+fn apply_operator<T: PlotNum>(output_queue: &mut Vec<T>, op: char) -> Result<(), String> {
     match op {
-        '+' | '-' | '*' | '/' | '^' | '%' | '$' | '&' | '|' | '~' => {
+        '+' | '-' | '*' | '/' | '^' | '%' | '$' | '&' | '|' | '~' | '<' | '>' => {
             apply_binary_operator(output_queue, op)?
         }
+        // Two-argument functions. Args left-to-right on the queue, so pop b then a.
+        'm' | 'M' | 'A' => {
+            if let (Some(b), Some(a)) = (output_queue.pop(), output_queue.pop()) {
+                let result = match op {
+                    'm' => a.min(b),
+                    'M' => a.max(b),
+                    'A' => a.atan2(b), // atan2(y = a, x = b)
+                    _ => unreachable!(),
+                };
+                output_queue.push(result);
+            } else {
+                return Err(format!("Not enough operands for {}", op));
+            }
+        }
+        // Three-argument clamp(x, lo, hi): queue is [x, lo, hi], pop hi, lo, x.
+        'K' => {
+            if let (Some(hi), Some(lo), Some(x)) =
+                (output_queue.pop(), output_queue.pop(), output_queue.pop())
+            {
+                output_queue.push(x.clamp(lo, hi));
+            } else {
+                return Err("Not enough operands for clamp".to_string());
+            }
+        }
         'n' | '!' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
-        | 't' => {
+        | 't' | 'e' | 'b' | 'L' | 'Q' | 'R' | 'h' | 'H' | 'y' => {
             if let Some(value) = output_queue.pop() {
                 let result = apply_unary_operator(op, value)?;
                 output_queue.push(result);
@@ -326,11 +419,14 @@ fn apply_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
 fn get_precedence(op: char) -> Precedence {
     match op {
         '&' | '|' | '~' => Precedence::Logic,
+        '<' | '>' => Precedence::Shift,
         '+' | '-' => Precedence::Addition,
         '*' | '/' | '%' => Precedence::Multiplication,
         '^' | '$' => Precedence::Exponentiation,
         'n' | '!' | 'a' | 'O' | 'o' | 'S' | 'T' | 'c' | 'f' | 'F' | 'l' | 'r' | 'g' | 's' | 'q'
-        | 't' => Precedence::Unary,
+        | 't' | 'e' | 'b' | 'L' | 'Q' | 'R' | 'h' | 'H' | 'y' | 'm' | 'M' | 'K' | 'A' => {
+            Precedence::Unary
+        }
         '(' | ')' => Precedence::Parenthesis,
         _ => Precedence::Addition,
     }
@@ -340,11 +436,11 @@ fn get_precedence(op: char) -> Precedence {
 // apply_unary_operator — basecalc:1831-1965, real-only with S43 ops
 // ============================================================================
 
-fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
+fn apply_unary_operator<T: PlotNum>(op: char, value: T) -> Result<T, String> {
     let result = match op {
-        'n' => -value,
-        '!' => !value,
-        'a' => value.magnitude(),
+        'n' => value.neg(),
+        '!' => value.not(),
+        'a' => value.abs(),
         'S' => value.asin(),
         'O' => value.acos(),
         'T' => value.atan(),
@@ -358,6 +454,14 @@ fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
         's' => value.sin(),
         'o' => value.cos(),
         't' => value.tan(),
+        'e' => value.exp(),
+        'b' => value.powb(),
+        'L' => value.lb(),
+        'Q' => value.square(),
+        'R' => value.recip(),
+        'h' => value.sinh(),
+        'H' => value.cosh(),
+        'y' => value.tanh(),
         _ => return Err(format!("Unknown unary operator: {}", op)),
     };
     Ok(result)
@@ -367,20 +471,23 @@ fn apply_unary_operator(op: char, value: S43) -> Result<S43, String> {
 // apply_binary_operator — basecalc:1980-2007, with S43 ops
 // ============================================================================
 
-fn apply_binary_operator(output_queue: &mut Vec<S43>, op: char) -> Result<(), String> {
+fn apply_binary_operator<T: PlotNum>(output_queue: &mut Vec<T>, op: char) -> Result<(), String> {
     if let (Some(b), Some(a)) = (output_queue.pop(), output_queue.pop()) {
         let result = match op {
-            '%' => a % b,
+            '%' => a.rem(b),
             '^' => a.pow(b),
             '$' => a.log(b),
-            '*' => a * b,
-            '+' => a + b,
-            '-' => a - b,
-            '/' => a / b,
+            '*' => a.mul(b),
+            '+' => a.add(b),
+            '-' => a.sub(b),
+            '/' => a.div(b),
             // Spirix two's-complement bitwise, aligned at the binary point.
-            '&' => a & b,
-            '|' => a | b,
-            '~' => a ^ b,
+            '&' => a.bitand(b),
+            '|' => a.bitor(b),
+            '~' => a.bitxor(b),
+            // Bit shifts by an integer amount (RHS truncated toward zero). ×2ⁿ / ÷2ⁿ.
+            '<' => a.shl(b.to_f64() as i32),
+            '>' => a.shr(b.to_f64() as i32),
             _ => return Err(format!("Unknown binary operator: {}", op)),
         };
         output_queue.push(result);
@@ -533,34 +640,41 @@ fn parse_operator(input: &[u8], mut index: usize) -> (Token, usize) {
 // Spirix; numeric literals accumulate digits in base BASE)
 // ============================================================================
 
-fn token2num(token: &Token, x: S43, base: u8) -> S43 {
+fn token2num<T: PlotNum>(token: &Token, x: T, base: u8, fixed: FixedRand<T>) -> T {
     match token.operator {
         // Built-in constants (chars match basecalc's CONSTANTS table)
-        'E' => S43::E,
-        'G' => S43::EULER_GAMMA,
-        'C' => S43::CATALAN,
-        'p' => S43::PI,
-        'P' => S43::PHI,
+        'E' => T::e(),
+        'G' => T::gamma(),
+        'C' => T::catalan(),
+        'p' => T::pi(),
+        'P' => T::phi(),
         'X' => x,
+        // Per-sample random — a fresh draw each time the token is evaluated (per pixel-column
+        // in the plot / per audio sample), so @rand / @grand render as a noise band.
+        'w' => T::random(),
+        'z' => T::random_gauss(),
+        // Per-plot random — one draw held constant across the whole curve (@frand / @fgrand).
+        'W' => fixed.uniform,
+        'Z' => fixed.gauss,
 
-        // Regular numeric literal — accumulate base digits.
+        // Regular numeric literal — accumulate base digits in f64, then convert once to T.
+        // f64 is ample for user-typed literals; the target precision T applies to the maths,
+        // not the parse of the constant itself.
         _ => {
-            let base_s = S43::from(base as u32);
-            let mut real_int = S43::ZERO;
+            let b = base as f64;
+            let mut real = 0.0f64;
             for &digit in &token.real_integer {
-                real_int = real_int * base_s;
-                real_int = real_int + S43::from(digit as u32);
+                real = real * b + digit as f64;
             }
-            let mut real_frac = S43::ZERO;
+            let mut frac = 0.0f64;
             for &digit in token.real_fraction.iter().rev() {
-                real_frac = real_frac + S43::from(digit as u32);
-                real_frac = real_frac / base_s;
+                frac = (frac + digit as f64) / b;
             }
-            let mut real = real_int + real_frac;
+            real += frac;
             if token.sign {
-                real = S43::ZERO - real;
+                real = -real;
             }
-            real
+            T::from_f64(real)
         }
     }
 }

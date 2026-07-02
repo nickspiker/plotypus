@@ -8,6 +8,7 @@ use fluor::paint::Clip;
 use fluor::pixel::Blend;
 use fluor::text::TextRenderer;
 use fluor::BlendMode;
+use crate::plotnum::{PlotNum, Precision};
 use spirix::ScalarF4E3 as S43;
 
 /// Complement of the RGB bytes — converts a visible-RGB colour to fluor's darkness
@@ -61,6 +62,9 @@ pub fn draw_plot(
     formula: Option<&[Token]>,
     parse_failed: bool,
     base: u8,
+    precision: Precision,
+    // Per-plot fixed randoms (uniform, gauss) as f64 — drawn once at commit, constant across x.
+    fixed_rand: (f64, f64),
 ) {
     // Parse error → blank black plot region. Skipping grid + labels + curve makes "your formula didn't parse" obvious at a glance, distinct from a valid expression that happens to evaluate offscreen.
     if parse_failed {
@@ -74,11 +78,24 @@ pub fn draw_plot(
     draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size, base);
     draw_dyadic_grid(pixels, window_width, rect, view);
     if let Some(tokens) = formula {
-        // Eval errors (stack underflow, etc.) shouldn't fire on a token vector that
-        // tokenize() accepted — but if they do, fall back to INFINITY so the column
-        // shows as a yellow stripe (visible, not crashy).
-        let curve = |x: S43| formula::evaluate(tokens, x, base).unwrap_or(S43::INFINITY);
-        draw_curve(pixels, window_width, rect, view, curve);
+        // Evaluate the curve in the runtime-selected precision. `with_precision!` binds `T`
+        // to the concrete Scalar/f32/f64 type, so the whole column loop is monomorphized.
+        // Eval errors (stack underflow, etc.) shouldn't fire on a token vector tokenize()
+        // accepted — but if they do, fall back to INFINITY so the column shows as a yellow
+        // stripe (visible, not crashy).
+        crate::with_precision!(precision, T, {
+            // Per-plot fixed randoms, materialized once in the plot's type from the f64 values
+            // the app drew at commit time. Same value for every column (constant across x).
+            let fixed = formula::FixedRand {
+                uniform: T::from_f64(fixed_rand.0),
+                gauss: T::from_f64(fixed_rand.1),
+            };
+            let curve = |wx: f64| {
+                formula::evaluate::<T>(tokens, T::from_f64(wx), base, fixed)
+                    .unwrap_or(T::infinity())
+            };
+            draw_curve::<T>(pixels, window_width, rect, view, curve);
+        });
     }
     fill_bg(pixels, window_width, rect);
 }
@@ -102,7 +119,8 @@ pub fn draw_plot_curve(
     // Front-to-back, all darkness + `under` (see `draw_plot`): labels, grid, curve, bg.
     draw_axis_labels(pixels, text_renderer, damage, window_width, window_height, rect, view, label_font_size, base);
     draw_dyadic_grid(pixels, window_width, rect, view);
-    draw_curve(pixels, window_width, rect, view, curve);
+    // The synth voice is S43; adapt the f64 world-x the generic renderer feeds in.
+    draw_curve::<S43>(pixels, window_width, rect, view, |wx: f64| curve(S43::from(wx)));
     fill_bg(pixels, window_width, rect);
 }
 
@@ -119,7 +137,25 @@ fn fill_bg(pixels: &mut [u32], window_width: usize, rect: Rect) {
     }
 }
 
-/// 32×-supersampled area-chart renderer. Each column fills from the curve's pixel-y down to the bottom of the plot rect — no line, no baseline strip, just a filled region whose top edge is the curve.
+/// Deterministic per-sample jitter in `[0, 1)` — a cheap SplitMix64 hash of the
+/// `(column, subsample)` pair. Stable frame-to-frame (no shimmer on redraw) but random
+/// across columns and subsamples, so the stratified samples decorrelate from any signal
+/// frequency and break moiré banding into noise instead of coherent bands.
+#[inline]
+fn sample_jitter(px: usize, ss: usize) -> f64 {
+    let mut h = (px as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((ss as u64).wrapping_add(1).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    // Top 53 bits → f64 in [0, 1).
+    (h >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// 32×-supersampled area-chart renderer. Each column fills from the curve's pixel-y down to the bottom of the plot rect — no line, no baseline strip, just a filled region whose top edge is the curve. The 32 sub-x samples are STRATIFIED-JITTERED (one random position per 1/32 slice, via [`sample_jitter`]) so high-frequency curves don't moiré against a regular grid.
 ///
 /// For each subsample (32 per column):
 /// - `curve_frac < 0` (curve below the view): contributes nothing this subsample.
@@ -127,26 +163,29 @@ fn fill_bg(pixels: &mut [u32], window_width: usize, rect: Rect) {
 /// - else: drops to f32 to compute `curve_pix_y` and AAs the top row by its sub-pixel fraction; rows below get full coverage.
 ///
 /// The case split runs in S43 — `curve_frac` can be far outside `[0, 1]` (curve evaluator can return any Spirix state), and dropping to f32 first would saturate the test. Cost is `32 * rect.w` curve evaluations per frame.
-pub fn draw_curve(
+pub fn draw_curve<T: PlotNum>(
     pixels: &mut [u32],
     window_width: usize,
     rect: Rect,
     view: PlotView,
-    curve: impl Fn(S43) -> S43,
+    curve: impl Fn(f64) -> T,
 ) {
     const SUBSAMPLES: usize = 32;
     // Opaque fills in darkness convention (complement of the visible magenta/yellow/green).
     const FILL_UNDEFINED: u32 = 0xFF00_0000 | darken(0x00_E0_00_E0); // magenta
     const FILL_INFINITY: u32 = 0xFF00_0000 | darken(0x00_E0_E0_00); // yellow
     const FILL_ZERO: u32 = 0xFF00_0000 | darken(0x00_00_E0_00); // green
-    // Darkness RGB of the normal pink (positive) / blue (negative) fills.
-    let pos_rgb = darken(state_colour(S43::ONE)); // FF8080 → darkness
-    let neg_rgb = darken(state_colour(S43::NEG_ONE)); // 8080FF → darkness
+    // Darkness RGB of the normal pink (positive) / blue (negative) fills — fixed colours.
+    let pos_rgb = darken(0x00_FF_80_80);
+    let neg_rgb = darken(0x00_80_80_FF);
 
-    let x_range = view.x_max - view.x_min;
-    let y_range = view.y_max - view.y_min;
-    let x_scale = x_range / rect.w;
-    let frac_scale = x_scale >> 5;
+    // The camera (view) stays S43; the plotted value type T only governs the curve samples.
+    // World-x is computed in f64 (pixel-quantized anyway), then handed to the typed evaluator.
+    let x_min_f = view.x_min.to_f64();
+    let y_min_f = view.y_min.to_f64();
+    let x_scale_f = (view.x_max.to_f64() - x_min_f) / rect.w as f64;
+    let y_range_f = view.y_max.to_f64() - y_min_f;
+    let frac_scale_f = x_scale_f / SUBSAMPLES as f64;
 
     let rect_y = rect.y as f32;
     let rect_h = rect.h as f32;
@@ -162,14 +201,19 @@ pub fn draw_curve(
         cov_pos.iter_mut().for_each(|c| *c = 0.0);
         cov_neg.iter_mut().for_each(|c| *c = 0.0);
         let abs_px = rect.x + px;
-        let x = px * x_scale;
+        let base_x = px as f64 * x_scale_f;
         let mut fill: Option<u32> = None;
         // Whether the column fill runs from the y=0 line down (true) or full-height (false).
         let mut fill_from_zero = false;
 
         for ss in 0..SUBSAMPLES {
-            let frac_x = x + ss * frac_scale;
-            let world_x = view.x_min + frac_x;
+            // Stratified jitter: place the sample at a random position WITHIN its 1/32 slice
+            // rather than at the slice start. A regular grid resonates with high-frequency
+            // curves (fast sin, the escaped phase bands) and produces coherent moiré; jitter
+            // turns that into incoherent noise. Deterministic per (column, subsample) so it's
+            // stable frame-to-frame — the plot redraws on the blink timer, and fresh-random
+            // per frame would shimmer.
+            let world_x = x_min_f + base_x + (ss as f64 + sample_jitter(px, ss)) * frac_scale_f;
             let world_y = curve(world_x);
 
             // Off-scale / singular states fill the column as a solid marker rather than
@@ -200,11 +244,11 @@ pub fn draw_curve(
                 break;
             }
 
-            // Normal value: accumulate area coverage from the curve's pixel-y down.
-            // `curve_frac` can be far outside [0, 1], so the case test runs in S43 before
-            // we drop to f32.
-            let curve_frac = (world_y - view.y_min) / y_range;
-            if curve_frac < 0 {
+            // Normal value: accumulate area coverage from the curve's pixel-y down. Special
+            // classes are already filtered above, so world_y here is a finite normal; a huge
+            // normal that overflows f64 to ±inf still tests correctly against the 0/1 bounds.
+            let curve_frac = (world_y.to_f64() - y_min_f) / y_range_f;
+            if curve_frac < 0.0 {
                 continue; // curve below the view → no fill this subsample
             }
             let cov = if world_y.is_positive() {
@@ -212,11 +256,11 @@ pub fn draw_curve(
             } else {
                 &mut cov_neg
             };
-            if curve_frac > 1 {
+            if curve_frac > 1.0 {
                 // Curve above the view → fills the whole on-screen column.
                 cov.iter_mut().for_each(|c| *c += 1.0);
             } else {
-                let frac_f = curve_frac.to_f32();
+                let frac_f = curve_frac as f32;
                 let curve_pix_y = rect_y + (1. - frac_f) * rect_h;
                 let top_row = curve_pix_y as usize;
                 let top_cov = 1. - (curve_pix_y - curve_pix_y.floor());
@@ -277,11 +321,11 @@ pub fn draw_curve(
 /// and one extraction serves both signs. Spirix's `prefix()` is `pub(crate)`, so we read
 /// the top byte directly via `(fraction >> 8) as i8` — adjust the shift to `(F_BITS − 8)`
 /// for other Scalar widths.
-fn state_colour(world_y: S43) -> u32 {
-    let prefix: i8 = (world_y.fraction >> 8) as i8;
+fn state_colour<T: PlotNum>(world_y: T) -> u32 {
+    let raw = world_y.phase_byte();
     let pos = world_y.is_positive();
     // Fold negatives onto the positive class shape so one phase extraction works for both.
-    let p: u8 = if pos { prefix as u8 } else { !(prefix as u8) };
+    let p: u8 = if pos { raw } else { !raw };
 
     if world_y.is_exploded() {
         // 01xxxxxx → phase ∈ [0,0x3F]; map to channel [0xB0, 0xFF].
